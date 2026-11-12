@@ -1,3 +1,16 @@
+export function defaultExcludePatterns(configDir: string): string[] {
+  return [
+    `${configDir}/workspace.json`,
+    `${configDir}/workspace-mobile.json`,
+    '*.exe',
+    '*.zip',
+    'lh-windows-amd64-*/**',
+    'Obsidian-remote-template*',
+    '.obsidian，/**',
+    `${configDir}/plugins/*/main.js`,
+  ];
+}
+
 export async function sha256hex(data: ArrayBuffer): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(hashBuffer))

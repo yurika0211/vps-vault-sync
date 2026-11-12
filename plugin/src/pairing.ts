@@ -70,8 +70,8 @@ export class PairingClient {
   }
 }
 
-/** The action segment of the obsidian:// pairing URI, e.g. obsidian://self-hosted-vault-sync?... */
-export const PAIRING_PROTOCOL_ACTION = 'self-hosted-vault-sync';
+/** The action segment of the obsidian:// pairing URI, e.g. obsidian://vps-vault-sync?... */
+export const PAIRING_PROTOCOL_ACTION = 'vps-vault-sync';
 
 export function buildPairingUri(serverUrl: string, token: string, label: string): string {
   const params = new URLSearchParams({ server: serverUrl, token, label });

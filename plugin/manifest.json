@@ -1,7 +1,7 @@
 {
-  "id": "self-hosted-vault-sync",
-  "name": "Self-Hosted Vault Sync",
-  "version": "0.6.0",
+  "id": "vps-vault-sync",
+  "name": "VPS Vault Sync",
+  "version": "0.1.0",
   "minAppVersion": "1.4.0",
   "description": "Fast, reliable vault sync via a self-hosted server.",
   "author": "Valentin Britvich",

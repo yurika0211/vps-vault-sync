@@ -1,4 +1,4 @@
-import { SyncEngine, VaultAdapter } from '../engine';
+import { SyncEngine, VaultAdapter, conflictSiblingPath } from '../engine';
 import { SyncClient } from '../client';
 import { createState, StateStorage } from '../state';
 import { sha256hex } from '../util';
@@ -177,10 +177,11 @@ test('initialSync: uploads all when server is empty', async () => {
   expect(client.putFile).toHaveBeenCalledTimes(2);
 });
 
-test('initialSync: server wins — overwrites local files', async () => {
+test('initialSync: hash mismatch keeps local and writes a conflict sibling', async () => {
   const vault = makeVault({ 'notes/a.md': 'old local content' });
   const state = await createState(makeStorage({}));
   const serverContent = new TextEncoder().encode('server content').buffer as ArrayBuffer;
+  const localHash = await sha256hex(new TextEncoder().encode('old local content').buffer as ArrayBuffer);
   const client = makeClient({
     getChanges: jest.fn(async () => [
       { path: 'notes/a.md', hash: 'server-hash', ts: 1, action: 'modified' as const },
@@ -188,11 +189,42 @@ test('initialSync: server wins — overwrites local files', async () => {
     getFile: jest.fn(async () => serverContent),
   });
 
+  const onConflict = jest.fn();
+  const engine = new SyncEngine(client, vault, state, onConflict, '.obsidian');
+  await engine.initialSync();
+
+  expect(vault.writeFile).not.toHaveBeenCalledWith('notes/a.md', serverContent);
+  const written = (vault.writeFile as jest.Mock).mock.calls.map(c => c[0] as string);
+  expect(written.some(p => /^notes\/a\.conflict\.local\..+\.md$/.test(p))).toBe(true);
+  const conflictPath = written.find(p => p.includes('.conflict.local.'));
+  expect(conflictPath).toBeDefined();
+  expect(vault.writeFile).toHaveBeenCalledWith(conflictPath, serverContent);
+  expect(state.files['notes/a.md']).toBe(localHash);
+  expect(onConflict).toHaveBeenCalledWith('notes/a.md');
+});
+
+test('initialSync: equal hashes skip download and upload', async () => {
+  const body = new TextEncoder().encode('same').buffer as ArrayBuffer;
+  const hash = await sha256hex(body);
+  const vault = makeVault({ 'notes/a.md': 'same' });
+  const state = await createState(makeStorage({}));
+  const client = makeClient({
+    getChanges: jest.fn(async () => [
+      { path: 'notes/a.md', hash, ts: 1, action: 'modified' as const },
+    ]),
+  });
+
   const engine = new SyncEngine(client, vault, state, jest.fn(), '.obsidian');
   await engine.initialSync();
 
-  expect(vault.writeFile).toHaveBeenCalledWith('notes/a.md', serverContent);
-  expect(state.files['notes/a.md']).toBe('server-hash');
+  expect(client.getFile).not.toHaveBeenCalled();
+  expect(client.putFile).not.toHaveBeenCalled();
+  expect(state.files['notes/a.md']).toBe(hash);
+});
+
+test('conflictSiblingPath keeps stem, device, and extension', () => {
+  const path = conflictSiblingPath('notes/a.md', 'phone', new Date('2026-11-12T01:02:03.004Z'));
+  expect(path).toBe('notes/a.conflict.phone.2026-11-12T01-02-03-004Z.md');
 });
 
 test('pull: advances lastSyncTimestamp to max server ts (never NaN)', async () => {

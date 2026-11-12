@@ -42,6 +42,7 @@ type Handler struct {
 func New(s *store.Store, cl *changelog.Changelog, broker *sse.Broker, ts *tokens.Store) *Handler {
 	h := &Handler{store: s, changelog: cl, sse: broker, tokens: ts}
 	h.mux = http.NewServeMux()
+	h.mux.HandleFunc("GET /health", h.handleHealth)
 	h.mux.HandleFunc("GET /changes", h.withAuth(h.counted("GET /changes", h.handleChanges)))
 	h.mux.HandleFunc("GET /file/{path...}", h.withAuth(h.counted("GET /file", h.handleGetFile)))
 	h.mux.HandleFunc("PUT /file/{path...}", h.withAuth(h.logged(audit.FilePut, h.handlePutFile)))
@@ -57,6 +58,13 @@ func New(s *store.Store, cl *changelog.Changelog, broker *sse.Broker, ts *tokens
 	h.mux.HandleFunc("GET /admin/api/events", h.withAdmin(h.handleAdminEvents))
 	h.mux.HandleFunc("GET /admin/api/stats", h.withAdmin(h.handleAdminStats))
 	return h
+}
+
+// handleHealth is unauthenticated. It does not read tokens or vault state.
+func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"ok":true}`))
 }
 
 // ServeHTTP implements http.Handler.

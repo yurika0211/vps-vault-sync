@@ -91,7 +91,7 @@ test('parsePastedPairingLink trims surrounding whitespace', () => {
 });
 
 test('parsePastedPairingLink returns null for a link missing token', () => {
-  const result = parsePastedPairingLink('obsidian://self-hosted-vault-sync?server=https://sync.example.com');
+  const result = parsePastedPairingLink('obsidian://vps-vault-sync?server=https://sync.example.com');
   expect(result).toBeNull();
 });
 

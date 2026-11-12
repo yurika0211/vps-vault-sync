@@ -1,3 +1,9 @@
+export class Modal {
+  constructor(public app: any) {}
+  open(): void {}
+  close(): void {}
+}
+
 export class Plugin {
   app: any = {};
   manifest: any = {};

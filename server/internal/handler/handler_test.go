@@ -37,6 +37,15 @@ func newHandler(t *testing.T) *handler.Handler {
 	return handler.New(s, cl, broker, newTokens(t, dir))
 }
 
+func TestHealthUnauthenticated(t *testing.T) {
+	h := newHandler(t)
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.JSONEq(t, `{"ok":true}`, w.Body.String())
+}
+
 func TestAuthRejectsNoToken(t *testing.T) {
 	h := newHandler(t)
 	req := httptest.NewRequest("GET", "/changes", nil)

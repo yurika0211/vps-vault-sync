@@ -334,20 +334,38 @@ export class SyncEngine {
       }
     }
 
-    // Download server files (server wins on conflict)
-    for (const [path, hash] of serverFiles) {
+    // Three-way by content hash. Local bytes are never overwritten by the
+    // server copy. A hash mismatch keeps the local file and writes the remote
+    // bytes beside it.
+    const skippedDeleted: string[] = [];
+    const localPaths = await this.vault.listAll();
+    const localSet = new Set(localPaths);
+
+    for (const [path, remoteHash] of serverFiles) {
       try {
+        if (!localSet.has(path)) {
+          const data = await this.client.getFile(path);
+          await this.vault.writeFile(path, data);
+          await this.state.setFileHash(path, remoteHash);
+          continue;
+        }
+        const local = await this.vault.readFile(path);
+        const localHash = await sha256hex(local);
+        if (localHash === remoteHash) {
+          await this.state.setFileHash(path, remoteHash);
+          continue;
+        }
         const data = await this.client.getFile(path);
-        await this.vault.writeFile(path, data);
-        await this.state.setFileHash(path, hash);
+        const conflictPath = conflictSiblingPath(path);
+        await this.vault.writeFile(conflictPath, data);
+        await this.state.setFileHash(path, localHash);
+        this.onConflict(path);
       } catch (e) {
-        console.error(`[vault-sync] initial sync: failed to download ${path}:`, e);
+        console.error(`[vault-sync] initial sync: failed to reconcile ${path}:`, e);
       }
     }
 
     // Upload local files not on server
-    const skippedDeleted: string[] = [];
-    const localPaths = await this.vault.listAll();
     for (const path of localPaths) {
       if (serverFiles.has(path)) continue; // already handled above
       try {
@@ -375,4 +393,16 @@ export class SyncEngine {
     await this.state.setLastSyncTimestamp(Math.floor(Date.now() / 1000));
     return { skippedDeleted };
   }
+}
+
+/** Sibling path for a remote copy that must not overwrite the local file. */
+export function conflictSiblingPath(path: string, device = 'local', now = new Date()): string {
+  const stamp = now.toISOString().replace(/[:.]/g, '-');
+  const slash = path.lastIndexOf('/');
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : '';
+  const base = slash >= 0 ? path.slice(slash + 1) : path;
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : '';
+  return `${dir}${stem}.conflict.${device}.${stamp}${ext}`;
 }

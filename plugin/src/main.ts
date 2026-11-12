@@ -1,5 +1,6 @@
 import { Notice, ObsidianProtocolData, Platform, Plugin, TFile } from 'obsidian';
-import { SyncSettings, SyncSettingTab, DEFAULT_SETTINGS, defaultExcludePatterns } from './settings';
+import { SyncSettings, SyncSettingTab, DEFAULT_SETTINGS } from './settings';
+import { defaultExcludePatterns } from './util';
 import { createState, PersistedSyncState, StateStorage } from './state';
 import { SyncClient } from './client';
 import { SyncEngine, VaultAdapter } from './engine';
@@ -18,12 +19,16 @@ import { SyncLog, Throttle, LogEntry } from './synclog';
 // lets everything downstream — settings fields, syncState — stay fully typed.
 interface PluginData {
   serverUrl?: string;
+  // Legacy field only. New saves omit it; load migrates any leftover into
+  // secretStorage and strips it from data.json.
   authToken?: string;
   syncInterval?: number;
   exclude?: string[];
   syncState?: PersistedSyncState;
   syncLog?: LogEntry[];
 }
+
+const AUTH_TOKEN_SECRET = 'auth-token';
 
 export default class VaultSyncPlugin extends Plugin {
   settings!: SyncSettings;
@@ -67,8 +72,17 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    await this.persistAuthToken(this.settings.authToken);
     const cur = ((await this.loadData()) as PluginData | undefined) ?? {};
-    await this.saveData({ ...cur, ...this.settings });
+    const { authToken: _dropped, ...rest } = cur;
+    const { authToken: _memory, ...persisted } = this.settings;
+    await this.saveData({ ...rest, ...persisted });
+  }
+
+  private persistAuthToken(token: string): void {
+    const secrets = this.app.secretStorage;
+    if (!secrets?.setSecret || !token) return;
+    secrets.setSecret(AUTH_TOKEN_SECRET, token);
   }
 
   async runInitialSync(): Promise<void> {
@@ -101,7 +115,7 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   /**
-   * Handles an obsidian://self-hosted-vault-sync pairing link. This is how an
+   * Handles an obsidian://vps-vault-sync pairing link. This is how an
    * unconfigured device (no serverUrl/authToken yet) gets set up: scanning the
    * QR from an already-paired device opens Obsidian and lands here with no
    * manual field entry required. Runs a full initialSync (not just a pull) so
@@ -199,7 +213,7 @@ export default class VaultSyncPlugin extends Plugin {
 
     const saved = ((await this.loadData()) as PluginData | undefined)?.syncLog;
     this.syncLog = new SyncLog(saved, async (entries) => {
-      const cur = ((await this.loadData()) as PluginData | undefined) ?? {};
+      const cur = this.withoutAuthToken((await this.loadData()) as PluginData | undefined);
       await this.saveData({ ...cur, syncLog: entries });
     });
 
@@ -209,7 +223,7 @@ export default class VaultSyncPlugin extends Plugin {
         return d?.syncState;
       },
       save: async (d: PersistedSyncState) => {
-        const cur = ((await this.loadData()) as PluginData | undefined) ?? {};
+        const cur = this.withoutAuthToken((await this.loadData()) as PluginData | undefined);
         await this.saveData({ ...cur, syncState: d });
       },
     };
@@ -366,12 +380,24 @@ export default class VaultSyncPlugin extends Plugin {
 
   private async loadSettings(): Promise<void> {
     const data = ((await this.loadData()) as PluginData | undefined) ?? {};
+    const stored = this.app.secretStorage?.getSecret(AUTH_TOKEN_SECRET) ?? '';
+    const legacy = data.authToken ?? '';
+    const authToken = stored || legacy || DEFAULT_SETTINGS.authToken;
     this.settings = {
       serverUrl: data.serverUrl ?? DEFAULT_SETTINGS.serverUrl,
-      authToken: data.authToken ?? DEFAULT_SETTINGS.authToken,
+      authToken,
       syncInterval: data.syncInterval ?? DEFAULT_SETTINGS.syncInterval,
       exclude: data.exclude ?? defaultExcludePatterns(this.app.vault.configDir),
     };
+    if (legacy || stored !== authToken) {
+      await this.saveSettings();
+    }
+  }
+
+  private withoutAuthToken(data: PluginData | undefined): Omit<PluginData, 'authToken'> {
+    const cur = data ?? {};
+    const { authToken: _dropped, ...rest } = cur;
+    return rest;
   }
 }
 

@@ -4,6 +4,9 @@ import { PairingClient, PairedDevice } from './pairing';
 import { PairingModal } from './pairingModal';
 import { OnboardingModal } from './onboardingWizard';
 import { errorMessage } from './errors';
+import { defaultExcludePatterns } from './util';
+
+export { defaultExcludePatterns };
 
 export interface SyncSettings {
   serverUrl: string;
@@ -18,16 +21,6 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   syncInterval: 30,
   exclude: [],
 };
-
-// Obsidian's config folder isn't necessarily ".obsidian" (Vault#configDir is
-// user-configurable), so this can't be a static default — it's computed once
-// the plugin knows the real value, in main.ts's loadSettings().
-export function defaultExcludePatterns(configDir: string): string[] {
-  return [
-    `${configDir}/workspace.json`,
-    `${configDir}/workspace-mobile.json`,
-  ];
-}
 
 export class SyncSettingTab extends PluginSettingTab {
   private newDeviceLabel = '';
@@ -90,7 +83,7 @@ export class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Initial sync')
-      .setDesc('Download all files from server, overwriting local. Server wins.')
+      .setDesc('Compare by content hash. Missing files are copied. If both copies differ, the local file stays and the server copy is written beside it as a conflict file.')
       .addButton(b => b
         .setButtonText('Start initial sync')
         .onClick(() => this.plugin.runInitialSync()));

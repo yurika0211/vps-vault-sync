@@ -88,7 +88,7 @@ export class OnboardingModal extends Modal {
     new Setting(contentEl)
       .setName('Paste pairing link')
       .addText(t => t
-        .setPlaceholder('obsidian://self-hosted-vault-sync?...')
+        .setPlaceholder('obsidian://vps-vault-sync?...')
         .onChange(v => { pastedLink = v; }));
 
     this.renderConnectRow(contentEl, (statusEl, connectButton) => {
