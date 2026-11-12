@@ -12,6 +12,7 @@ export interface SyncSettings {
   serverUrl: string;
   authToken: string;
   syncInterval: number;
+  pushDebounceSeconds: number;
   exclude: string[];
 }
 
@@ -19,8 +20,27 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   serverUrl: '',
   authToken: '',
   syncInterval: 30,
+  pushDebounceSeconds: 2,
   exclude: [],
 };
+
+export const PUSH_DEBOUNCE_MIN_SECONDS = 0;
+export const PUSH_DEBOUNCE_MAX_SECONDS = 30;
+
+/** Clamp to an integer in [0, 30]. Invalid values become the 2 second default. */
+export function clampPushDebounceSeconds(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_SETTINGS.pushDebounceSeconds;
+  const rounded = Math.min(
+    PUSH_DEBOUNCE_MAX_SECONDS,
+    Math.max(PUSH_DEBOUNCE_MIN_SECONDS, Math.round(n)),
+  );
+  return rounded;
+}
+
+export function pushDebounceDelayMs(seconds: unknown): number {
+  return clampPushDebounceSeconds(seconds) * 1000;
+}
 
 export class SyncSettingTab extends PluginSettingTab {
   private newDeviceLabel = '';
@@ -63,11 +83,24 @@ export class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Sync interval (seconds)')
+      .setDesc('How often to poll the server. Changing this applies the next time the sync loop starts.')
       .addSlider(s => s
         .setLimits(10, 300, 10)
         .setValue(this.plugin.settings.syncInterval)
         .onChange(async v => {
           this.plugin.settings.syncInterval = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Push debounce (seconds)')
+      .setDesc('Wait after a local edit before uploading that file. 0 pushes immediately. The next edit uses the saved value.')
+      .addSlider(s => s
+        .setLimits(PUSH_DEBOUNCE_MIN_SECONDS, PUSH_DEBOUNCE_MAX_SECONDS, 1)
+        .setValue(this.plugin.settings.pushDebounceSeconds)
+        .setDynamicTooltip()
+        .onChange(async v => {
+          this.plugin.settings.pushDebounceSeconds = clampPushDebounceSeconds(v);
           await this.plugin.saveSettings();
         }));
 

@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+
+permissions:
+  contents: read
+
+jobs:
+  server-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Require tag vX.Y.Z
+        run: |
+          if ! printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag must be exactly vX.Y.Z, got: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set lowercase repository owner
+        run: echo "OWNER_LC=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ env.OWNER_LC }}/vps-vault-sync-server:${{ github.ref_name }}
+            ghcr.io/${{ env.OWNER_LC }}/vps-vault-sync-server:latest
+
+  plugin-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - name: Require tag vX.Y.Z
+        run: |
+          if ! printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag must be exactly vX.Y.Z, got: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+      - name: Set manifest version from tag
+        run: |
+          node -e "
+            const fs = require('fs');
+            const m = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+            const tag = process.env.GITHUB_REF_NAME || '';
+            if (!/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag)) {
+              console.error('tag must be exactly vX.Y.Z, got: ' + tag);
+              process.exit(1);
+            }
+            m.version = tag.slice(1);
+            fs.writeFileSync('manifest.json', JSON.stringify(m, null, 2) + '\n');
+          "
+
+      - name: Stage release assets
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p release
+          cp plugin/main.js plugin/manifest.json release/
+          if [ -f plugin/styles.css ]; then cp plugin/styles.css release/; fi
+          ls -l release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*

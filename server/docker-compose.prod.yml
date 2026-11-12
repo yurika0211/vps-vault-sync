@@ -1,0 +1,10 @@
+# Deploy the image built by the root GitHub Actions release workflow.
+# No secrets. The bootstrap token is printed once in the container log.
+services:
+  vault-sync:
+    image: ghcr.io/yurika0211/vps-vault-sync-server:${VPS_VAULT_SYNC_TAG:-latest}
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    ports:
+      - "8080:8080"

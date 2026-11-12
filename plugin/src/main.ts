@@ -1,5 +1,5 @@
 import { Notice, ObsidianProtocolData, Platform, Plugin, TFile } from 'obsidian';
-import { SyncSettings, SyncSettingTab, DEFAULT_SETTINGS } from './settings';
+import { SyncSettings, SyncSettingTab, DEFAULT_SETTINGS, clampPushDebounceSeconds, pushDebounceDelayMs } from './settings';
 import { defaultExcludePatterns, matchGlob } from './util';
 import { createState, PersistedSyncState, StateStorage } from './state';
 import { SyncClient } from './client';
@@ -23,6 +23,7 @@ interface PluginData {
   // secretStorage and strips it from data.json.
   authToken?: string;
   syncInterval?: number;
+  pushDebounceSeconds?: number;
   exclude?: string[];
   syncState?: PersistedSyncState;
   syncLog?: LogEntry[];
@@ -294,7 +295,7 @@ export default class VaultSyncPlugin extends Plugin {
     window.clearTimeout(this.debounceMap.get(file.path));
     this.debounceMap.set(file.path, window.setTimeout(() => {
       this.runPush(file.path).catch(console.error);
-    }, 2000));
+    }, pushDebounceDelayMs(this.settings.pushDebounceSeconds)));
   }
 
   private onFileDelete(file: { path: string }): void {
@@ -387,6 +388,9 @@ export default class VaultSyncPlugin extends Plugin {
       serverUrl: data.serverUrl ?? DEFAULT_SETTINGS.serverUrl,
       authToken,
       syncInterval: data.syncInterval ?? DEFAULT_SETTINGS.syncInterval,
+      pushDebounceSeconds: clampPushDebounceSeconds(
+        data.pushDebounceSeconds ?? DEFAULT_SETTINGS.pushDebounceSeconds,
+      ),
       exclude: data.exclude ?? defaultExcludePatterns(this.app.vault.configDir),
     };
     // Always rewrite plugin data when a legacy token is present, even if
