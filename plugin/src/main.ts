@@ -1,6 +1,6 @@
 import { Notice, ObsidianProtocolData, Platform, Plugin, TFile } from 'obsidian';
 import { SyncSettings, SyncSettingTab, DEFAULT_SETTINGS } from './settings';
-import { defaultExcludePatterns } from './util';
+import { defaultExcludePatterns, matchGlob } from './util';
 import { createState, PersistedSyncState, StateStorage } from './state';
 import { SyncClient } from './client';
 import { SyncEngine, VaultAdapter } from './engine';
@@ -72,11 +72,10 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    await this.persistAuthToken(this.settings.authToken);
-    const cur = ((await this.loadData()) as PluginData | undefined) ?? {};
-    const { authToken: _dropped, ...rest } = cur;
+    this.persistAuthToken(this.settings.authToken);
+    const cur = pluginDataWithoutAuthToken((await this.loadData()) as PluginData | undefined);
     const { authToken: _memory, ...persisted } = this.settings;
-    await this.saveData({ ...rest, ...persisted });
+    await this.saveData({ ...cur, ...persisted });
   }
 
   private persistAuthToken(token: string): void {
@@ -89,7 +88,7 @@ export default class VaultSyncPlugin extends Plugin {
     if (!this.engine) await this.initEngine();
     this.setStatus('syncing');
     try {
-      const { skippedDeleted } = await this.engine.initialSync();
+      const { skippedDeleted } = await this.engine.initialSync((path) => this.isExcluded(path));
       this.setStatus('synced');
       new Notice('Initial sync complete');
       if (skippedDeleted.length > 0) {
@@ -213,7 +212,7 @@ export default class VaultSyncPlugin extends Plugin {
 
     const saved = ((await this.loadData()) as PluginData | undefined)?.syncLog;
     this.syncLog = new SyncLog(saved, async (entries) => {
-      const cur = this.withoutAuthToken((await this.loadData()) as PluginData | undefined);
+      const cur = pluginDataWithoutAuthToken((await this.loadData()) as PluginData | undefined);
       await this.saveData({ ...cur, syncLog: entries });
     });
 
@@ -223,7 +222,7 @@ export default class VaultSyncPlugin extends Plugin {
         return d?.syncState;
       },
       save: async (d: PersistedSyncState) => {
-        const cur = this.withoutAuthToken((await this.loadData()) as PluginData | undefined);
+        const cur = pluginDataWithoutAuthToken((await this.loadData()) as PluginData | undefined);
         await this.saveData({ ...cur, syncState: d });
       },
     };
@@ -379,9 +378,10 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   private async loadSettings(): Promise<void> {
-    const data = ((await this.loadData()) as PluginData | undefined) ?? {};
+    const raw = ((await this.loadData()) as PluginData | undefined) ?? {};
+    const data = pluginDataWithoutAuthToken(raw);
     const stored = this.app.secretStorage?.getSecret(AUTH_TOKEN_SECRET) ?? '';
-    const legacy = data.authToken ?? '';
+    const legacy = raw.authToken ?? '';
     const authToken = stored || legacy || DEFAULT_SETTINGS.authToken;
     this.settings = {
       serverUrl: data.serverUrl ?? DEFAULT_SETTINGS.serverUrl,
@@ -389,26 +389,17 @@ export default class VaultSyncPlugin extends Plugin {
       syncInterval: data.syncInterval ?? DEFAULT_SETTINGS.syncInterval,
       exclude: data.exclude ?? defaultExcludePatterns(this.app.vault.configDir),
     };
+    // Always rewrite plugin data when a legacy token is present, even if
+    // secretStorage cannot store it. The token stays in memory only.
     if (legacy || stored !== authToken) {
       await this.saveSettings();
     }
   }
-
-  private withoutAuthToken(data: PluginData | undefined): Omit<PluginData, 'authToken'> {
-    const cur = data ?? {};
-    const { authToken: _dropped, ...rest } = cur;
-    return rest;
-  }
 }
 
-function matchGlob(pattern: string, path: string): boolean {
-  const regex = new RegExp(
-    '^' +
-    pattern
-      .replace(/\./g, '\\.')
-      .replace(/\*\*/g, '.*')       // ** matches across path separators
-      .replace(/(?<!\.\*)\*/g, '[^/]*')  // single * matches within one segment
-    + '$'
-  );
-  return regex.test(path);
+/** Plugin data.json never keeps the auth token. */
+export function pluginDataWithoutAuthToken(data: PluginData | undefined): Omit<PluginData, 'authToken'> {
+  const cur = data ?? {};
+  const { authToken: _dropped, ...rest } = cur;
+  return rest;
 }

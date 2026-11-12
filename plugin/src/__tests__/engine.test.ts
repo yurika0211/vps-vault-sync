@@ -203,6 +203,32 @@ test('initialSync: hash mismatch keeps local and writes a conflict sibling', asy
   expect(onConflict).toHaveBeenCalledWith('notes/a.md');
 });
 
+test('initialSync: skips excluded and unsafe paths on download and upload', async () => {
+  const vault = makeVault({
+    'tools/helper.exe': 'bin',
+    'keep.md': 'local',
+    '.obsidian/community-plugins.json': 'nope',
+  });
+  const remoteExe = new TextEncoder().encode('remote-exe').buffer as ArrayBuffer;
+  const client = makeClient({
+    getChanges: jest.fn(async () => [
+      { path: 'tools/other.exe', hash: 'exe-hash', ts: 1, action: 'modified' as const },
+      { path: '../escape.md', hash: 'bad', ts: 1, action: 'modified' as const },
+    ]),
+    getFile: jest.fn(async () => remoteExe),
+  });
+  const engine = new SyncEngine(client, vault, await createState(makeStorage({})), jest.fn(), '.obsidian');
+  const excluded = (path: string) => path.endsWith('.exe');
+
+  await engine.initialSync(excluded);
+
+  expect(client.getFile).not.toHaveBeenCalled();
+  expect(client.putFile).not.toHaveBeenCalledWith('tools/helper.exe', expect.anything(), expect.anything());
+  expect(client.putFile).not.toHaveBeenCalledWith('.obsidian/community-plugins.json', expect.anything(), expect.anything());
+  expect(client.putFile).toHaveBeenCalledWith('keep.md', expect.anything(), '');
+  expect(vault.writeFile).not.toHaveBeenCalled();
+});
+
 test('initialSync: equal hashes skip download and upload', async () => {
   const body = new TextEncoder().encode('same').buffer as ArrayBuffer;
   const hash = await sha256hex(body);

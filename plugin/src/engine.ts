@@ -317,7 +317,7 @@ export class SyncEngine {
     }
   }
 
-  async initialSync(): Promise<InitialSyncResult> {
+  async initialSync(isExcluded: (path: string) => boolean = () => false): Promise<InitialSyncResult> {
     const changes = await this.client.getChanges(0);
 
     // Build server file set, and remember when each currently-deleted path
@@ -342,6 +342,7 @@ export class SyncEngine {
     const localSet = new Set(localPaths);
 
     for (const [path, remoteHash] of serverFiles) {
+      if (!isSafeSyncPath(path, this.configDir) || isExcluded(path)) continue;
       try {
         if (!localSet.has(path)) {
           const data = await this.client.getFile(path);
@@ -368,6 +369,7 @@ export class SyncEngine {
     // Upload local files not on server
     for (const path of localPaths) {
       if (serverFiles.has(path)) continue; // already handled above
+      if (!isSafeSyncPath(path, this.configDir) || isExcluded(path)) continue;
       try {
         // "Not on the server" is ambiguous: never uploaded, or deleted there.
         // A local copy that isn't newer than the deletion is a stale leftover

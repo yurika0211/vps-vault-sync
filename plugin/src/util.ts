@@ -1,3 +1,20 @@
+/**
+ * `**` matches across `/`, including nested segments.
+ * A pattern whose only wildcard is `*` (no `**`) also matches across `/`,
+ * so `*.exe` excludes `tools/helper.exe`. When `**` is present, a lone `*`
+ * stays inside one segment (`plugins/ * /main.js`).
+ */
+export function matchGlob(pattern: string, path: string): boolean {
+  const STARSTAR = '\u0000';
+  const star = pattern.includes('**') ? '[^/]*' : '.*';
+  const source = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, STARSTAR)
+    .replace(/\*/g, star)
+    .replace(new RegExp(STARSTAR, 'g'), '.*');
+  return new RegExp('^' + source + '$').test(path);
+}
+
 export function defaultExcludePatterns(configDir: string): string[] {
   return [
     `${configDir}/workspace.json`,
