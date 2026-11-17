@@ -7,11 +7,47 @@ export interface Change {
   action: 'modified' | 'deleted';
 }
 
+export interface ChangePage { changes: Change[]; cursor: number; hasMore: boolean }
+
 export class SyncClient {
   constructor(private serverUrl: string, private authToken: string) {}
 
   private headers(extra: Record<string, string> = {}): Record<string, string> {
     return { Authorization: `Bearer ${this.authToken}`, ...extra };
+  }
+
+  async getChangePage(cursor: number): Promise<ChangePage> {
+    const resp = await requestUrl({ url: `${this.serverUrl}/changes?cursor=${cursor}&limit=256`, headers: this.headers(), throw: false });
+    if (resp.status >= 400) throw new Error(`getChanges failed: ${resp.status}`);
+    const page = resp.json as ChangePage;
+    if (!page || !Array.isArray(page.changes) || !Number.isSafeInteger(page.cursor) || page.cursor < cursor || typeof page.hasMore !== 'boolean' || (page.hasMore && page.cursor === cursor)) {
+      throw new Error('Server does not support safe sync cursors. Update the server first.');
+    }
+    return page;
+  }
+
+  async getSnapshot(): Promise<ChangePage> {
+    const latest = new Map<string, Change>();
+    let cursor = 0;
+    for (;;) {
+      const page = await this.getChangePage(cursor);
+      for (const change of page.changes) latest.set(change.path, change);
+      cursor = page.cursor;
+      if (!page.hasMore) return { changes: [...latest.values()], cursor, hasMore: false };
+    }
+  }
+
+  async getFileInfo(path: string): Promise<{ hash: string; action: string } | null> {
+    const resp = await requestUrl({ url: `${this.serverUrl}/file-info/${encodeFilePath(path)}`, headers: this.headers(), throw: false });
+    if (resp.status === 404) return null;
+    if (resp.status >= 400) throw new Error(`getFileInfo failed: ${resp.status}`);
+    return resp.json as { hash: string; action: string };
+  }
+
+  async getConflicts(): Promise<Change[]> {
+    const resp = await requestUrl({ url: `${this.serverUrl}/conflicts`, headers: this.headers(), throw: false });
+    if (resp.status >= 400) throw new Error(`getConflicts failed: ${resp.status}`);
+    return resp.json as Change[];
   }
 
   async getChanges(since: number): Promise<Change[]> {
@@ -33,6 +69,14 @@ export class SyncClient {
       throw: false,
     });
     if (resp.status >= 400) throw new Error(`getFile failed: ${resp.status}`);
+    return resp.arrayBuffer;
+  }
+
+  async getFileAt(path: string, hash: string): Promise<ArrayBuffer> {
+    const resp = await requestUrl({ url: `${this.serverUrl}/file/${encodeFilePath(path)}?hash=${encodeURIComponent(hash)}`, headers: this.headers(), throw: false });
+    if (resp.status >= 400) throw new Error(`getFile failed: ${resp.status}`);
+    const { sha256hex } = await import('./util');
+    if (await sha256hex(resp.arrayBuffer) !== hash) throw new Error('Downloaded content does not match its version');
     return resp.arrayBuffer;
   }
 

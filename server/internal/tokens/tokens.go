@@ -15,6 +15,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/atomicfile"
 )
 
 // lastSeenThrottle bounds how often Verify persists a LastSeenAt update,
@@ -45,12 +47,13 @@ type Store struct {
 	path    string
 	mu      sync.Mutex
 	entries []Entry
+	revoked map[string]chan struct{}
 }
 
 // New loads the token store from path, or starts empty if the file doesn't
 // exist yet (first run).
 func New(path string) (*Store, error) {
-	s := &Store{path: path, entries: []Entry{}}
+	s := &Store{path: path, entries: []Entry{}, revoked: make(map[string]chan struct{})}
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return s, nil
@@ -69,7 +72,7 @@ func (s *Store) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0600)
+	return atomicfile.Write(s.path, data, 0600)
 }
 
 // Bootstrap ensures at least one device token exists. If the store is
@@ -96,6 +99,7 @@ func (s *Store) Bootstrap(seed string) (rawToken string, created bool, err error
 		LastSeenAt: now,
 	})
 	if err := s.save(); err != nil {
+		s.entries = s.entries[:len(s.entries)-1]
 		return "", false, err
 	}
 	return raw, true, nil
@@ -118,6 +122,7 @@ func (s *Store) Issue(label string) (id string, rawToken string, err error) {
 		LastSeenAt: now,
 	})
 	if err = s.save(); err != nil {
+		s.entries = s.entries[:len(s.entries)-1]
 		return "", "", err
 	}
 	return id, rawToken, nil
@@ -163,8 +168,17 @@ func (s *Store) Revoke(id string) (found bool, err error) {
 	defer s.mu.Unlock()
 	for i, e := range s.entries {
 		if e.ID == id {
+			old := append([]Entry(nil), s.entries...)
 			s.entries = append(s.entries[:i], s.entries[i+1:]...)
-			return true, s.save()
+			if err := s.save(); err != nil {
+				s.entries = old
+				return true, err
+			}
+			if ch, ok := s.revoked[id]; ok {
+				close(ch)
+				delete(s.revoked, id)
+			}
+			return true, nil
 		}
 	}
 	return false, nil
@@ -173,6 +187,23 @@ func (s *Store) Revoke(id string) (found bool, err error) {
 func hashToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+// Revoked is closed immediately when the device is revoked.
+func (s *Store) Revoked(id string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.entries {
+		if e.ID == id {
+			if s.revoked[id] == nil {
+				s.revoked[id] = make(chan struct{})
+			}
+			return s.revoked[id]
+		}
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
 }
 
 func randomHex(n int) string {

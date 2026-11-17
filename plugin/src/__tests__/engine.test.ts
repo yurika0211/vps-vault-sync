@@ -59,7 +59,7 @@ test('pull: downloads modified files and updates state', async () => {
 
 test('pull: deletes files marked as deleted', async () => {
   const vault = makeVault({ 'old.md': 'content' });
-  const state = await createState(makeStorage({ files: { 'old.md': 'hash' }, lastSyncTimestamp: 0 }));
+  const state = await createState(makeStorage({ files: { 'old.md': await sha256hex(buf('content')) }, lastSyncTimestamp: 0 }));
   const client = makeClient({
     getChanges: jest.fn(async () => [
       { path: 'old.md', hash: '', ts: 300, action: 'deleted' as const },
@@ -73,7 +73,7 @@ test('pull: deletes files marked as deleted', async () => {
   expect(state.files['old.md']).toBeUndefined();
 });
 
-test('pull: silently skips server update when user modified locally', async () => {
+test('pull: records conflict and keeps both copies when user modified locally', async () => {
   // Simulates user typing while pull is downloading: file changes between
   // the last sync and writeFile. Must not overwrite user's work.
   const originalContent = 'original text';
@@ -101,9 +101,8 @@ test('pull: silently skips server update when user modified locally', async () =
   const engine = new SyncEngine(client, vault, state, onConflict, '.obsidian');
   await engine.pull();
 
-  // No conflict notification (silent skip), file NOT overwritten
-  expect(onConflict).not.toHaveBeenCalled();
-  expect(vault.writeFile).not.toHaveBeenCalled();
+  expect(onConflict).toHaveBeenCalledWith('notes/race.md');
+  expect(vault.writeFile).not.toHaveBeenCalledWith('notes/race.md', expect.anything());
   
   // User's content preserved
   const finalContent = new TextDecoder().decode(await vault.readFile('notes/race.md'));
@@ -181,7 +180,6 @@ test('initialSync: hash mismatch keeps local and writes a conflict sibling', asy
   const vault = makeVault({ 'notes/a.md': 'old local content' });
   const state = await createState(makeStorage({}));
   const serverContent = new TextEncoder().encode('server content').buffer as ArrayBuffer;
-  const localHash = await sha256hex(new TextEncoder().encode('old local content').buffer as ArrayBuffer);
   const client = makeClient({
     getChanges: jest.fn(async () => [
       { path: 'notes/a.md', hash: 'server-hash', ts: 1, action: 'modified' as const },
@@ -199,7 +197,8 @@ test('initialSync: hash mismatch keeps local and writes a conflict sibling', asy
   const conflictPath = written.find(p => p.includes('.conflict.local.'));
   expect(conflictPath).toBeDefined();
   expect(vault.writeFile).toHaveBeenCalledWith(conflictPath, serverContent);
-  expect(state.files['notes/a.md']).toBe(localHash);
+  expect(state.files['notes/a.md']).toBeUndefined();
+  expect(state.conflicts['notes/a.md']).toBe('server-hash');
   expect(onConflict).toHaveBeenCalledWith('notes/a.md');
 });
 
@@ -296,8 +295,8 @@ test('pull: one failing file does not abort the whole pull', async () => {
   expect(vault.writeFile).toHaveBeenCalledWith('good.md', good);
   expect(state.files['good.md']).toBe('hg');
   expect(state.files['bad.md']).toBeUndefined();
-  // Timestamp advances so a permanently-missing blob doesn't wedge sync forever.
-  expect(state.lastSyncTimestamp).toBe(20);
+  // Keep the page available for retry; successful files are skipped by hash.
+  expect(state.lastSyncTimestamp).toBe(0);
 });
 
 test('pull: skips unsafe paths from server', async () => {
@@ -321,10 +320,9 @@ test('pull: skips unsafe paths from server', async () => {
   expect(vault.writeFile).not.toHaveBeenCalledWith('.obsidian/community-plugins.json', expect.anything());
 });
 
-test('pull: torn-write skip advances state to server hash (prevents conflict storm)', async () => {
+test('pull: concurrent local edit keeps its base and blocks automatic overwrite', async () => {
   // Scenario: server has H1, client state tracks H0, user edits to H_user during download.
-  // The skip must record H1 (server hash) in state so the next push sends
-  // X-Base-Hash: H1 (correct), not H0 (stale — causes infinite conflict storm).
+  // Preserve the real base and require an explicit conflict resolution.
   const enc = (s: string) => new TextEncoder().encode(s).buffer as ArrayBuffer;
 
   const originalContent = 'original text';
@@ -354,14 +352,15 @@ test('pull: torn-write skip advances state to server hash (prevents conflict sto
   await engine.pull();
 
   // Server write must be skipped — user's content preserved
-  expect(vault.writeFile).not.toHaveBeenCalled();
-  // Base hash MUST advance to server hash so the next push sends the correct X-Base-Hash
-  expect(state.files['notes/daily.md']).toBe(serverHash);
+  expect(vault.writeFile).not.toHaveBeenCalledWith('notes/daily.md', expect.anything());
+  expect(state.files['notes/daily.md']).toBe(originalHash);
+  expect(state.conflicts['notes/daily.md']).toBe(serverHash);
 });
 
 test('pull: mass-change guard blocks a batch deleting >=50% of known files when declined', async () => {
   const files = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`note${i}.md`, 'content']));
-  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, 'hash']));
+  const contentHash = await sha256hex(buf('content'));
+  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, contentHash]));
   const vault = makeVault(files);
   const state = await createState(makeStorage({ files: knownFiles, lastSyncTimestamp: 0 }));
   const client = makeClient({
@@ -374,7 +373,7 @@ test('pull: mass-change guard blocks a batch deleting >=50% of known files when 
   const engine = new SyncEngine(client, vault, state, jest.fn(), '.obsidian', onMassChange);
   await engine.pull();
 
-  expect(onMassChange).toHaveBeenCalledWith(6, 10);
+  expect(onMassChange).toHaveBeenCalledWith(6, 10, expect.any(Array));
   expect(vault.deleteFile).not.toHaveBeenCalled();
   expect(state.lastSyncTimestamp).toBe(0);
   expect(Object.keys(state.files)).toHaveLength(10);
@@ -382,7 +381,8 @@ test('pull: mass-change guard blocks a batch deleting >=50% of known files when 
 
 test('pull: mass-change guard applies the batch normally when approved', async () => {
   const files = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`note${i}.md`, 'content']));
-  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, 'hash']));
+  const contentHash = await sha256hex(buf('content'));
+  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, contentHash]));
   const vault = makeVault(files);
   const state = await createState(makeStorage({ files: knownFiles, lastSyncTimestamp: 0 }));
   const client = makeClient({
@@ -395,7 +395,7 @@ test('pull: mass-change guard applies the batch normally when approved', async (
   const engine = new SyncEngine(client, vault, state, jest.fn(), '.obsidian', onMassChange);
   await engine.pull();
 
-  expect(onMassChange).toHaveBeenCalledWith(6, 10);
+  expect(onMassChange).toHaveBeenCalledWith(6, 10, expect.any(Array));
   expect(vault.deleteFile).toHaveBeenCalledTimes(6);
   expect(state.lastSyncTimestamp).toBe(15);
 });
@@ -403,7 +403,7 @@ test('pull: mass-change guard applies the batch normally when approved', async (
 test('pull: mass-change guard does not fire under the absolute floor even at high ratio', async () => {
   // 2 known files, both deleted = 100% but under MASS_CHANGE_MIN_AFFECTED (5).
   const vault = makeVault({ 'a.md': 'x', 'b.md': 'y' });
-  const state = await createState(makeStorage({ files: { 'a.md': 'ha', 'b.md': 'hb' }, lastSyncTimestamp: 0 }));
+  const state = await createState(makeStorage({ files: { 'a.md': await sha256hex(buf('x')), 'b.md': await sha256hex(buf('y')) }, lastSyncTimestamp: 0 }));
   const client = makeClient({
     getChanges: jest.fn(async () => [
       { path: 'a.md', hash: '', ts: 1, action: 'deleted' as const },
@@ -423,7 +423,8 @@ test('pull: mass-change guard does not fire under the ratio even with many known
   // 10 known files, 4 deleted = 40%, under the 50% ratio (even though 4 < floor too,
   // this asserts the ratio math itself, not just the floor).
   const files = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`note${i}.md`, 'content']));
-  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, 'hash']));
+  const contentHash = await sha256hex(buf('content'));
+  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, contentHash]));
   const vault = makeVault(files);
   const state = await createState(makeStorage({ files: knownFiles, lastSyncTimestamp: 0 }));
   const client = makeClient({
@@ -443,7 +444,8 @@ test('pull: mass-change guard does not fire under the ratio even with many known
 test('pull: default onMassChange (unset) applies batches normally', async () => {
   // No 6th arg passed — matches every pre-existing call site in this file.
   const files = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`note${i}.md`, 'content']));
-  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, 'hash']));
+  const contentHash = await sha256hex(buf('content'));
+  const knownFiles = Object.fromEntries(Object.keys(files).map(p => [p, contentHash]));
   const vault = makeVault(files);
   const state = await createState(makeStorage({ files: knownFiles, lastSyncTimestamp: 0 }));
   const client = makeClient({
@@ -495,12 +497,12 @@ describe('pull: echo suppression', () => {
     const vault = makeVault({ 'old.md': 'content' });
     // Real Obsidian fires the vault 'delete' event while deleteFile runs; the
     // plugin's listener calls pushDelete then. Simulate that.
-    const state = await createState(makeStorage({ files: { 'old.md': 'hash' }, lastSyncTimestamp: 0 }));
+    const state = await createState(makeStorage({ files: { 'old.md': await sha256hex(buf('content')) }, lastSyncTimestamp: 0 }));
     const client = makeClient({
       getChanges: jest.fn(async () => [{ path: 'old.md', hash: '', ts: 300, action: 'deleted' as const }]),
     });
     const engine = new SyncEngine(client, vault, state, jest.fn(), '.obsidian');
-    vault.deleteFile.mockImplementation(async () => { await engine.pushDelete('old.md'); });
+    vault.deleteFile.mockImplementation(async () => { void engine.pushDelete('old.md'); });
 
     await engine.pull();
 
@@ -510,7 +512,7 @@ describe('pull: echo suppression', () => {
 
   test('prunes empty parent folders after applying a server deletion', async () => {
     const vault = makeVault({ 'a/b/old.md': 'content' });
-    const state = await createState(makeStorage({ files: { 'a/b/old.md': 'hash' }, lastSyncTimestamp: 0 }));
+    const state = await createState(makeStorage({ files: { 'a/b/old.md': await sha256hex(buf('content')) }, lastSyncTimestamp: 0 }));
     const client = makeClient({
       getChanges: jest.fn(async () => [{ path: 'a/b/old.md', hash: '', ts: 300, action: 'deleted' as const }]),
     });
@@ -691,7 +693,7 @@ describe('initialSync: does not resurrect server-side deletions', () => {
     expect(result.skippedDeleted).toEqual(['stale.md']);
   });
 
-  test('uploads a local file that was edited after the server deleted it', async () => {
+  test('requires confirmation even if local mtime is newer than server deletion', async () => {
     const vault = makeVault({ 'back.md': 'recreated' });
     vault.mtime.mockImplementation(async () => (DELETED_AT + 50) * 1000);
     const state = await createState(makeStorage({}));
@@ -700,11 +702,12 @@ describe('initialSync: does not resurrect server-side deletions', () => {
 
     const result = await engine.initialSync();
 
-    expect(client.putFile).toHaveBeenCalledWith('back.md', expect.anything(), '');
-    expect(result.skippedDeleted).toEqual([]);
+    expect(client.putFile).not.toHaveBeenCalled();
+    expect(result.skippedDeleted).toEqual(['back.md']);
+    expect(state.conflicts['back.md']).toBe('deleted');
   });
 
-  test('uploads when the modification time is unknown', async () => {
+  test('requires confirmation when deletion conflicts with an unknown modification time', async () => {
     const vault = makeVault({ 'x.md': 'c' });
     const state = await createState(makeStorage({}));
     const client = serverWithDeleted('x.md');
@@ -712,8 +715,8 @@ describe('initialSync: does not resurrect server-side deletions', () => {
 
     const result = await engine.initialSync();
 
-    expect(client.putFile).toHaveBeenCalledWith('x.md', expect.anything(), '');
-    expect(result.skippedDeleted).toEqual([]);
+    expect(client.putFile).not.toHaveBeenCalled();
+    expect(result.skippedDeleted).toEqual(['x.md']);
   });
 });
 
@@ -743,7 +746,7 @@ test('pull: downloads a path once however many times the server lists it', async
 
 test('pull: modified then deleted ends up deleted and downloads nothing', async () => {
   const vault = makeVault({ 'a.md': 'old' });
-  const state = await createState(makeStorage({ files: { 'a.md': 'h0' } }));
+  const state = await createState(makeStorage({ files: { 'a.md': await sha256hex(buf('old')) } }));
   const client = makeClient({
     getChanges: jest.fn(async () => [
       { path: 'a.md', hash: 'h1', ts: 10, action: 'modified' as const },
@@ -822,7 +825,7 @@ test('pull: one failing file does not stop the others and is logged', async () =
 
   expect(r).toMatchObject({ downloaded: 1, failed: 1 });
   expect(state.files['good.md']).toBe('g');
-  expect(state.lastSyncTimestamp).toBe(2);
+  expect(state.lastSyncTimestamp).toBe(0);
   const text = log.toText();
   expect(text).toContain('error');
   expect(text).toContain('bad.md');
@@ -890,6 +893,7 @@ test('pull: a second call during a pull does not run concurrently, but is not lo
 
   const engine = new SyncEngine(client, vault, state, jest.fn(), '.obsidian');
   const first = engine.pull();
+  await new Promise<void>(resolve => setImmediate(resolve));
   const second = engine.pull(); // e.g. SSE event or poll timer mid-pull
   release();
   await Promise.all([first, second]);
@@ -912,7 +916,9 @@ test('pull: overlapping signals coalesce into a single follow-up', async () => {
     }),
   });
   const engine = new SyncEngine(client, vault, state, jest.fn(), '.obsidian');
-  const all = [engine.pull(), engine.pull(), engine.pull(), engine.pull()];
+  const first = engine.pull();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const all = [first, engine.pull(), engine.pull(), engine.pull()];
   release();
   await Promise.all(all);
   expect(calls).toBe(2);

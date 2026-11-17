@@ -14,6 +14,7 @@ export class MassChangeModal extends Modal {
     app: App,
     private affected: number,
     private known: number,
+    private paths: string[] = [],
   ) {
     super(app);
   }
@@ -23,12 +24,14 @@ export class MassChangeModal extends Modal {
       this.resolve = resolve;
       this.open();
     });
+
   }
 
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h2', { text: 'Unusual sync activity detected' });
+    if (this.paths.length) contentEl.createEl('pre', { text: this.paths.slice(0, 30).join('\n') + (this.paths.length > 30 ? '\n…' : '') });
 
     const percent = Math.round((this.affected / this.known) * 100);
     contentEl.createEl('p', {

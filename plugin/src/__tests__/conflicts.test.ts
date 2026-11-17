@@ -109,12 +109,12 @@ test('keepLocal uploads the original bytes only with the current canonical hash'
   expect(result).toEqual({ ok: true, hash });
 });
 
-test('keepServer writes the sibling only after a matching upload', async () => {
+test('keepServer downloads the verified canonical bytes without uploading a conflict copy', async () => {
   const incoming = bytes('server copy');
   const hash = await sha256hex(incoming);
   const written: string[] = [];
   const client: ConflictClient = {
-    getChanges: async () => [{ path: 'notes/a.md', hash: 'old', action: 'modified' }],
+    getChanges: async () => [{ path: 'notes/a.md', hash, action: 'modified' }],
     getFile: async () => incoming,
     putFile: async (_path, _data, baseHash) => {
       expect(baseHash).toBe('old');

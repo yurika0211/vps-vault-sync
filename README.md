@@ -19,7 +19,17 @@ One tag releases both artifacts. Push a tag named exactly `vX.Y.Z`, three numeri
 
 That tag push builds and pushes the storage-server image, and attaches the plugin files to a GitHub Release. The image tags are `vX.Y.Z` and `latest`. The plugin `manifest.json` version is `X.Y.Z` (the tag without the leading `v`). Do not push a tag from a machine that should not publish.
 
-CI on pull requests and on pushes to `feat/vps-vault-sync-sample`, `main`, and `master` runs plugin lint, test, and build, and `go test ./...`. It does not push an image.
+CI on pull requests and on pushes to `feat/vps-vault-sync-sample`, `main`, and `master` runs plugin lint, type checking, tests and build, Go race tests, and two-client HTTP integration tests. It does not push an image.
+
+## Upgrade and sync behavior
+
+Upgrade this repository's **server first**, then all plugins. The plugin requires Obsidian **1.11.4+** and the new sequence-cursor API; an upstream server or an older image cannot provide that API. The server retains the legacy `since` endpoint, but old clients still have its timestamp limitations. Back up the complete server data directory before upgrading. Do not trim/reorder `changelog.jsonl` or restore only its index: saved cursors refer to stable log positions. Run one server process per data directory.
+
+New clients use bounded pages and fetch each file by its content hash. Failed pages remain retriable. Local edits/deletions are queued persistently and rescanned on startup; successful uploads precede pending deletions so a failed rename does not delete the old server copy. Exclude patterns apply in both directions. Vault configuration, `.git`, `.trash`, and conflict copies are never automatically synced.
+
+Settings offer **Review connection**, **Pause/Resume sync**, **Sync now / retry**, and **Disconnect and clear token**. Pairing links open a review screen showing the destination and current vault; connecting requires confirmation. Sync status distinguishes pending work, conflicts, errors, and completed work. Changes while paused are picked up when resumed.
+
+If the server reports a deletion but a local file has unsent edits, the local file is retained for an explicit conflict choice. Initial sync never restores a tombstoned path based on device timestamps. A fully empty local listing is treated conservatively: the plugin does not infer an offline delete-all from it.
 
 ## Deploy the server on a VPS
 
@@ -33,7 +43,7 @@ docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml logs -f vault-sync
 ```
 
-`docker-compose.prod.yml` uses `ghcr.io/yurika0211/vps-vault-sync-server`. It publishes `8080` and mounts `./data` to `/data`. Omit `VPS_VAULT_SYNC_TAG` to pull `:latest`. Do not put a token in the compose file or the image.
+`docker-compose.prod.yml` uses `ghcr.io/yurika0211/vps-vault-sync-server`. It publishes `127.0.0.1:8080` and mounts `./data` to `/data`. Put a TLS reverse proxy in front. For direct private-network access, explicitly set `VPS_VAULT_SYNC_BIND` to that host's private/Tailscale IPv4 address. Omit `VPS_VAULT_SYNC_TAG` to pull `:latest`. Do not put a token in the compose file or the image.
 
 On a fresh `./data` the process logs one bootstrap device token. Copy it from that log line. It is not printed again. Do not commit it.
 
@@ -60,7 +70,7 @@ cd server
 docker compose up
 ```
 
-The image is `ghcr.io/peoneer/self-hosted-vault-sync-server:latest` and publishes `8080`.
+The image is `ghcr.io/peoneer/self-hosted-vault-sync-server:latest` and publishes `127.0.0.1:8080`. It is an upstream experiment, **not compatible with this fork's new cursor client**. Build this tree or use this repository's server release for the current plugin.
 
 On a fresh data directory the process logs one bootstrap device token. Copy it from that log line. It is not printed again. Do not commit it.
 
@@ -121,16 +131,29 @@ Initial sync writes a local sibling, `<stem>.conflict.<device>.<timestamp><ext>`
 
 Open **Open conflict panel** from the command palette, or **Conflicts** in plugin settings. Each row shows the original path, the conflict copy path, and which side is canonical.
 
-- **Open both** opens the original and a vault sibling. A server-only copy is named in a notice.
+- **Compare local and server** previews the current versions, capped at 128 KiB each. Binary files are not rendered as a visual diff.
 - **Keep local** uploads the original path's current bytes with the server's current hash as `X-Base-Hash`. A mismatch leaves the canonical file unchanged.
-- **Keep server** uploads the conflict-copy bytes with that same matching base hash, then writes those bytes to the original path. A mismatch writes nothing.
+- **Keep server** downloads the current canonical server file and verifies its hash before writing locally. A rejected upload is never mistaken for server content. An explicit deletion conflict can also be resolved by keeping the server deletion.
 - **Dismiss** asks first, then deletes the conflict copy. The original path stays.
 
-Deleting a resolved sibling is allowed. A later ordinary push still needs a matching base hash.
+Resolved copies remain available for recovery and are labelled accordingly; delete them explicitly when no longer needed. Automatic uploads for an unresolved path remain blocked.
+
+## Security and capacity boundaries
+
+This is a single-owner server: every paired device can read/write the whole vault, pair another device, and revoke any device. The separate admin token only opens the admin API. Revoking a device closes its active event streams. Tokens are long-lived; pairing links and QR codes are credentials. The server sees plaintext files: transport TLS/private tunnels are required, and there is no end-to-end encryption.
+
+The server admits two uploads at a time (excess returns `429`, retried by the client), with a 100 MiB per-file limit; uploads and downloads still buffer complete files. Incremental lookup uses a cached log and pages of at most 256 entries. The log cache still grows with history, index updates still rewrite `index.json`, and blob garbage collection/quotas are not implemented. Capacity follow-up: [issue #8](https://github.com/yurika0211/vps-vault-sync/issues/8). Durable mutation intents recover interrupted metadata commits; a storage error may return `503` for an operation that is later completed during recovery, so clients reconcile before retrying.
 
 ## Tests
 
 ```bash
-cd plugin && npm test
-cd server && go test ./...
+cd plugin
+npm ci
+npm run typecheck
+npm run lint
+npm test -- --runInBand
+npm run build
+npm run test:integration # needs Go; isolated temporary data and loopback only
+cd ../server
+GOWORK=off go test -race ./...
 ```

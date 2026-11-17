@@ -4,19 +4,19 @@ import { sha256hex, runPool } from './util';
 import { errorMessage } from './errors';
 import type { SyncLog } from './synclog';
 
-function isSafeSyncPath(path: string, configDir: string): boolean {
+export function isSafeVaultPath(path: string, configDir: string): boolean {
   if (!path || path.length === 0) return false;
   if (path.startsWith('/')) return false;
-  if (path.includes('..')) return false;
-  if (path.startsWith(`${configDir}/`)) return false;
-  // Conflict copies (.conflict.<timestamp>.md) are server-side artefacts for
-  // conflict resolution. They must not be synced back to the client vault:
-  // they would appear as real notes, trigger modify events, and in edge cases
-  // create secondary push cycles. The server stores them; the client ignores them.
-  if (/\.conflict\.\d{4}-\d{2}-\d{2}T[\d.-]+\.md$/.test(path)) return false;
+  if (path.includes('\\') || path.includes(':') || path.split('/').some(p => !p || p === '.' || p === '..')) return false;
+  if (path === configDir || path.startsWith(`${configDir}/`)) return false;
+  if (path.split('/').some(p => p === '.git' || p === '.trash')) return false;
   // eslint-disable-next-line no-control-regex -- deliberately matches control chars/null bytes to reject unsafe sync paths, not a mistake
   if (/[\x00-\x1f]/.test(path)) return false;
   return true;
+}
+
+export function isSafeSyncPath(path: string, configDir: string): boolean {
+  return isSafeVaultPath(path, configDir) && !path.includes('.conflict.');
 }
 
 export interface VaultAdapter {
@@ -35,8 +35,7 @@ export interface VaultAdapter {
 }
 
 export interface InitialSyncResult {
-  // Local files NOT uploaded because the server had deleted them and the local
-  // copy is not newer than that deletion (a stale copy, not a new file).
+  // Local files requiring an explicit restore because the server deleted them.
   skippedDeleted: string[];
 }
 
@@ -64,6 +63,7 @@ export interface PullResult {
   downloaded: number; // files written or deleted locally
   skipped: number; // already up to date / unsafe path / kept local edit
   failed: number;
+  blocked?: boolean;
 }
 
 // Keeps the last entry for each path, in order of those last entries.
@@ -85,9 +85,28 @@ export class SyncEngine {
     // most of the vault as deleted. Resolving false aborts the whole batch
     // (nothing applied, lastSyncTimestamp not advanced, so it's re-evaluated
     // next poll); resolving true applies it normally.
-    private onMassChange: (affected: number, known: number) => Promise<boolean> = async () => true,
+    private onMassChange: (affected: number, known: number, paths?: string[]) => Promise<boolean> = async () => true,
     private log?: SyncLog,
+    private isExcluded: (path: string) => boolean = () => false,
   ) {}
+
+  private tasks: Promise<unknown> = Promise.resolve();
+  private stopped = false;
+  private serial<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.tasks.catch(() => {}).then(() => {
+      if (this.stopped) throw new Error('Sync paused');
+      return run();
+    });
+    this.tasks = next;
+    return next;
+  }
+  async stop(): Promise<void> { this.stopped = true; await this.tasks.catch(() => {}); }
+  runExclusive<T>(action: () => Promise<T>): Promise<T> { return this.serial(action); }
+  private allowed(path: string): boolean { return isSafeSyncPath(path, this.configDir) && !this.isExcluded(path); }
+  private async conflict(path: string, remoteHash: string): Promise<void> {
+    await this.state.setConflict(path, remoteHash || 'deleted');
+    this.onConflict(path);
+  }
 
   // pull() calls that arrive while one is running don't start a second one (the
   // poll timer fires every 30s and a big catch-up takes longer than that, so
@@ -102,7 +121,7 @@ export class SyncEngine {
       this.pullAgain = true;
       return this.pulling;
     }
-    this.pulling = (async () => {
+    this.pulling = this.serial(async () => {
       let total: PullResult = { changes: 0, downloaded: 0, skipped: 0, failed: 0 };
       try {
         do {
@@ -113,43 +132,43 @@ export class SyncEngine {
             downloaded: total.downloaded + r.downloaded,
             skipped: total.skipped + r.skipped,
             failed: total.failed + r.failed,
+            blocked: total.blocked || r.blocked,
           };
         } while (this.pullAgain);
         return total;
       } finally {
         this.pulling = null;
       }
-    })();
+    });
     return this.pulling;
   }
 
   private async pullOnce(): Promise<PullResult> {
     const result: PullResult = { changes: 0, downloaded: 0, skipped: 0, failed: 0 };
-    const raw = await this.client.getChanges(this.state.lastSyncTimestamp);
+    const page = this.client.getChangePage ? await this.client.getChangePage(this.state.cursor) : null;
+    const raw = page ? page.changes : await this.client.getChanges(this.state.lastSyncTimestamp);
     if (raw.length === 0) return result;
 
-    // Only the last entry per path matters: replaying a file's whole edit
-    // history would download it once per edit. The server already sends it
-    // this way; doing it here too keeps an older server from being slow.
+    // Only the last entry per path in this page matters.
     const changes = latestPerPath(raw);
     result.changes = changes.length;
 
     const known = Object.keys(this.state.files).length;
     const affected = new Set(
       changes
-        .filter(c => c.action === 'deleted' || c.action === 'modified')
+        .filter(c => this.allowed(c.path) && (c.action === 'deleted' || c.hash !== this.state.files[c.path]))
         .map(c => c.path)
         .filter(path => path in this.state.files),
     ).size;
 
-    if (affected >= MASS_CHANGE_MIN_AFFECTED && affected / known >= MASS_CHANGE_RATIO) {
-      const proceed = await this.onMassChange(affected, known);
-      if (!proceed) return result;
+    const deletes = changes.filter(c => c.action === 'deleted' && this.allowed(c.path) && c.path in this.state.files).length;
+    if ((affected >= MASS_CHANGE_MIN_AFFECTED && affected / known >= MASS_CHANGE_RATIO) || deletes >= 50) {
+      const proceed = await this.onMassChange(affected, known, changes.filter(c => this.allowed(c.path)).map(c => `${c.action}: ${c.path}`));
+      if (!proceed) return { ...result, blocked: true };
     }
 
-    // Track the high-water mark from the server's `ts` field. We advance it even
-    // past entries that fail below, so a single permanently-missing blob can't
-    // wedge sync into re-pulling the whole changelog on every poll forever.
+    // Commit a cursor only when this page completes. Failed downloads remain
+    // retriable, while successful paths are skipped by their stored hash.
     let maxTs = this.state.lastSyncTimestamp;
     for (const change of raw) {
       if (typeof change.ts === 'number' && change.ts > maxTs) maxTs = change.ts;
@@ -168,7 +187,10 @@ export class SyncEngine {
         else result.failed++;
         if (++processed % PULL_SAVE_EVERY === 0) await this.state.flush();
       });
-      await this.state.setLastSyncTimestamp(maxTs);
+      if (result.failed === 0) {
+        await this.state.setLastSyncTimestamp(maxTs);
+        if (page) { await this.state.setCursor(page.cursor); this.pullAgain = this.pullAgain || page.hasMore; }
+      }
     } finally {
       this.state.deferSaves = false;
       await this.state.flush();
@@ -186,19 +208,25 @@ export class SyncEngine {
   // write failure) must not abort the whole pull. Without this, sync dies with a
   // generic error and never tells you which file broke.
   private async applyChange(change: Change): Promise<'downloaded' | 'skipped' | 'failed'> {
-    if (!isSafeSyncPath(change.path, this.configDir)) {
+    if (!this.allowed(change.path)) {
       console.warn(`[vault-sync] pull: skipping unsafe path from server: ${change.path}`);
       return 'skipped';
     }
 
     try {
       if (change.action === 'deleted') {
-        // Forget the hash BEFORE touching the disk: deleting the file makes
-        // Obsidian fire a 'delete' event, whose handler calls pushDelete.
-        // With the path already untracked that is a no-op instead of an echo
-        // DELETE sent back to the server we just heard the deletion from.
+        if (await this.vault.exists(change.path)) {
+          const localHash = await sha256hex(await this.vault.readFile(change.path));
+          if (localHash !== this.state.files[change.path]) {
+            await this.conflict(change.path, 'deleted');
+            return 'skipped';
+          }
+        }
+        // A failed local delete must retain its state and retry. Echo events
+        // are queued behind this operation and see the committed removal.
+        await this.vault.deleteFile(change.path);
         await this.state.removeFileHash(change.path);
-        await this.vault.deleteFile(change.path).catch(() => {});
+        await this.state.queue(change.path, null);
         await this.vault.pruneEmptyParents(change.path).catch(() => {});
         return 'downloaded';
       }
@@ -207,28 +235,29 @@ export class SyncEngine {
       // coming back): nothing to download.
       if (this.state.files[change.path] === change.hash) return 'skipped';
 
-      const data = await this.client.getFile(change.path);
+      if (this.state.pending[change.path] === 'delete') {
+        await this.conflict(change.path, change.hash);
+        return 'skipped';
+      }
+
+      const data = this.client.getFileAt ? await this.client.getFileAt(change.path, change.hash) : await this.client.getFile(change.path);
 
       // Check if file was modified locally while we were fetching from server.
       // If it changed (user typed during the download), treat it as a conflict
       // rather than silently overwriting user's work with server data.
       const currentHash = this.state.files[change.path];
-      if (currentHash) {
-        try {
+      if (await this.vault.exists(change.path)) {
           const localData = await this.vault.readFile(change.path);
           const localHash = await sha256hex(localData);
-          if (localHash !== currentHash) {
-            // File changed locally while the server version was downloading.
-            // Don't overwrite user's work, but DO advance our stored base hash to
-            // the server's version. Without this, every future push sends the old
-            // X-Base-Hash; the server conflicts every time and spawns a new
-            // .conflict.* copy on each debounce cycle — an infinite storm.
-            await this.state.setFileHash(change.path, change.hash);
+          if (localHash !== currentHash && localHash !== change.hash) {
+            // Preserve the true base and both versions; automatic uploads are
+            // blocked until the user resolves the conflict.
+            if (this.state.conflicts[change.path] !== change.hash) {
+              await this.vault.writeFile(conflictSiblingPath(change.path), data);
+            }
+            await this.conflict(change.path, change.hash);
             return 'skipped';
           }
-        } catch {
-          // File doesn't exist locally or read failed — safe to write
-        }
       }
 
       await this.vault.writeFile(change.path, data);
@@ -241,7 +270,15 @@ export class SyncEngine {
     }
   }
 
-  async push(path: string): Promise<void> {
+  push(path: string): Promise<{ conflict: boolean }> { return this.serial(() => this.pushOnce(path)); }
+
+  private async pushOnce(path: string): Promise<{ conflict: boolean }> {
+    if (!this.allowed(path)) { await this.state.queue(path, null); return { conflict: false }; }
+    if (this.state.conflicts[path]) return { conflict: true };
+    if (!await this.vault.exists(path)) {
+      await this.state.queue(path, path in this.state.files ? 'delete' : null);
+      return { conflict: false };
+    }
     const data = await this.vault.readFile(path);
     const hash = await sha256hex(data);
 
@@ -250,25 +287,70 @@ export class SyncEngine {
     // 'modify' event), not a real user edit. Pushing it would create a server
     // changelog entry → SSE → pull → write → 'modify' → push … an endless loop
     // that re-uploads every file on a cycle. Nothing changed; do nothing.
-    if (this.state.files[path] === hash) return;
+    if (this.state.files[path] === hash) { await this.state.queue(path, null); return { conflict: false }; }
 
     const baseHash = this.state.files[path] ?? '';
     const result = await this.client.putFile(path, data, baseHash);
     if (result.conflict) {
-      this.onConflict(path);
+      await this.conflict(path, result.currentHash ?? 'unknown');
     } else {
       await this.state.setFileHash(path, hash);
+      // An edit arriving while the request was in flight remains queued.
+      if (await this.vault.exists(path) && await sha256hex(await this.vault.readFile(path)) === hash) await this.state.queue(path, null);
     }
+    return { conflict: result.conflict };
   }
 
-  async pushDelete(path: string): Promise<void> {
+  pushDelete(path: string): Promise<void> { return this.serial(() => this.deleteOnce(path)); }
+
+  private async deleteOnce(path: string): Promise<void> {
+    if (!this.allowed(path)) { await this.state.queue(path, null); return; }
+    if (this.state.conflicts[path]) return;
+    // A queued delete can outlive a recreation or a rename back to this path.
+    if (await this.vault.exists(path)) {
+      await this.state.queue(path, 'upload');
+      return;
+    }
     // Not tracked = the server was never told about this file, or we just
     // applied its deletion ourselves (see pull). Either way there is nothing
     // to send; sending would only produce a pointless 404/409.
-    if (!(path in this.state.files)) return;
+    if (!(path in this.state.files)) { await this.state.queue(path, null); return; }
     const baseHash = this.state.files[path];
     await this.client.deleteFile(path, baseHash);
     await this.state.removeFileHash(path);
+    await this.state.queue(path, null);
+  }
+
+  // Startup scan discovers changes made while Obsidian was closed. Subsequent
+  // polls retry only the persistent queue instead of rehashing the whole vault.
+  scanLocalChanges(): Promise<void> { return this.serial(() => this.scanLocalOnce()); }
+  private async scanLocalOnce(): Promise<void> {
+    this.state.deferSaves = true;
+    try {
+    const paths = await this.vault.listAll();
+    for (const path of paths) {
+      if (!this.allowed(path) || this.state.conflicts[path]) continue;
+      if (await sha256hex(await this.vault.readFile(path)) !== this.state.files[path]) await this.state.queue(path, 'upload');
+    }
+    if (paths.length === 0) return;
+    const missing: string[] = [];
+    for (const path of Object.keys(this.state.files)) {
+      if (this.allowed(path) && !await this.vault.exists(path)) missing.push(path);
+    }
+    const known = Object.keys(this.state.files).length;
+    if (missing.length >= 5 && missing.length / known >= 0.5 && !await this.onMassChange(missing.length, known, missing.map(p => `delete from server: ${p}`))) return;
+    for (const path of missing) await this.state.queue(path, 'delete');
+    } finally { this.state.deferSaves = false; await this.state.flush(); }
+  }
+
+  async retryPending(): Promise<number> {
+    let failures = 0;
+    for (const [path, action] of Object.entries(this.state.pending).sort((a, b) => Number(a[1] === 'delete') - Number(b[1] === 'delete'))) {
+      if (action === 'delete' && Object.values(this.state.pending).includes('upload')) continue;
+      try { if (action === 'delete') await this.pushDelete(path); else await this.push(path); }
+      catch (e) { failures++; this.log?.add('error', `retry "${path}": ${errorMessage(e)}`); }
+    }
+    return failures;
   }
 
   // Deletions made while the plugin wasn't listening (Obsidian closed, plugin
@@ -288,7 +370,7 @@ export class SyncEngine {
     const missing: string[] = [];
     for (const path of tracked) {
       if (local.has(path)) continue;
-      if (!isSafeSyncPath(path, this.configDir) || isExcluded(path)) continue;
+      if (!this.allowed(path) || isExcluded(path)) continue;
       // The listing can lag or filter; only trust the disk for the final call.
       if (await this.vault.exists(path)) continue;
       missing.push(path);
@@ -317,8 +399,16 @@ export class SyncEngine {
     }
   }
 
-  async initialSync(isExcluded: (path: string) => boolean = () => false): Promise<InitialSyncResult> {
-    const changes = await this.client.getChanges(0);
+  initialSync(isExcluded: (path: string) => boolean = () => false): Promise<InitialSyncResult> {
+    return this.serial(() => this.initialSyncOnce(isExcluded));
+  }
+
+  private async initialSyncOnce(isExcluded: (path: string) => boolean): Promise<InitialSyncResult> {
+    const snapshot = this.client.getSnapshot ? await this.client.getSnapshot() : null;
+    const changes = snapshot ? snapshot.changes : await this.client.getChanges(0);
+    let failures = 0;
+    this.state.deferSaves = true;
+    try {
 
     // Build server file set, and remember when each currently-deleted path
     // was deleted (seconds, server clock).
@@ -342,10 +432,15 @@ export class SyncEngine {
     const localSet = new Set(localPaths);
 
     for (const [path, remoteHash] of serverFiles) {
-      if (!isSafeSyncPath(path, this.configDir) || isExcluded(path)) continue;
+      if (!this.allowed(path) || isExcluded(path)) continue;
       try {
         if (!localSet.has(path)) {
-          const data = await this.client.getFile(path);
+          const data = this.client.getFileAt ? await this.client.getFileAt(path, remoteHash) : await this.client.getFile(path);
+          if (await this.vault.exists(path) && await sha256hex(await this.vault.readFile(path)) !== remoteHash) {
+            await this.vault.writeFile(conflictSiblingPath(path), data);
+            await this.conflict(path, remoteHash);
+            continue;
+          }
           await this.vault.writeFile(path, data);
           await this.state.setFileHash(path, remoteHash);
           continue;
@@ -356,12 +451,12 @@ export class SyncEngine {
           await this.state.setFileHash(path, remoteHash);
           continue;
         }
-        const data = await this.client.getFile(path);
+        const data = this.client.getFileAt ? await this.client.getFileAt(path, remoteHash) : await this.client.getFile(path);
         const conflictPath = conflictSiblingPath(path);
         await this.vault.writeFile(conflictPath, data);
-        await this.state.setFileHash(path, localHash);
-        this.onConflict(path);
+        await this.conflict(path, remoteHash);
       } catch (e) {
+        failures++;
         console.error(`[vault-sync] initial sync: failed to reconcile ${path}:`, e);
       }
     }
@@ -372,28 +467,31 @@ export class SyncEngine {
       if (!isSafeSyncPath(path, this.configDir) || isExcluded(path)) continue;
       try {
         // "Not on the server" is ambiguous: never uploaded, or deleted there.
-        // A local copy that isn't newer than the deletion is a stale leftover
-        // (e.g. a device that was offline) — uploading it would resurrect the
-        // file everywhere. Leave it alone and tell the user instead.
+        // Device clocks cannot safely decide whether to resurrect a file.
+        // Preserve the local copy and require an explicit user choice.
         const deletedTs = deletedAt.get(path);
         if (deletedTs !== undefined) {
-          const mtime = await this.vault.mtime(path);
-          if (mtime !== null && Math.floor(mtime / 1000) <= deletedTs) {
-            skippedDeleted.push(path);
-            continue;
-          }
+          skippedDeleted.push(path);
+          await this.conflict(path, 'deleted');
+          continue;
         }
         const data = await this.vault.readFile(path);
-        await this.client.putFile(path, data, '');
+        const uploaded = await this.client.putFile(path, data, '');
+        if (uploaded.conflict) { await this.conflict(path, uploaded.currentHash ?? 'unknown'); continue; }
         const hash = await sha256hex(data);
         await this.state.setFileHash(path, hash);
       } catch (e) {
+        failures++;
+        await this.state.queue(path, 'upload');
         console.error(`[vault-sync] initial sync: failed to upload ${path}:`, e);
       }
     }
 
-    await this.state.setLastSyncTimestamp(Math.floor(Date.now() / 1000));
+    if (failures > 0) throw new Error(`${failures} file(s) failed initial sync; retry after fixing the connection`);
+    await this.state.setLastSyncTimestamp(changes.reduce((max, c) => Math.max(max, c.ts), 0));
+    if (snapshot) await this.state.setCursor(snapshot.cursor);
     return { skippedDeleted };
+    } finally { this.state.deferSaves = false; await this.state.flush(); }
   }
 }
 

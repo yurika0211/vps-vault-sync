@@ -60,7 +60,7 @@ test('deferSaves keeps writes in memory until flush', async () => {
 
   await state.flush();
   expect(storage.save).toHaveBeenCalledTimes(1);
-  expect(storage.save).toHaveBeenCalledWith({ lastSyncTimestamp: 7, files: { 'a.md': 'h1', 'b.md': 'h2' } });
+  expect(storage.save).toHaveBeenCalledWith(expect.objectContaining({ lastSyncTimestamp: 7, files: { 'a.md': 'h1', 'b.md': 'h2' } }));
 
   await state.flush(); // nothing dirty any more
   expect(storage.save).toHaveBeenCalledTimes(1);

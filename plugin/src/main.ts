@@ -3,7 +3,7 @@ import { SyncSettings, SyncSettingTab, DEFAULT_SETTINGS, clampPushDebounceSecond
 import { defaultExcludePatterns, matchGlob } from './util';
 import { createState, PersistedSyncState, StateStorage, SyncState } from './state';
 import { SyncClient } from './client';
-import { SyncEngine, VaultAdapter } from './engine';
+import { SyncEngine, VaultAdapter, isSafeSyncPath, isSafeVaultPath } from './engine';
 import { SSEClient } from './sse';
 import { writeFileResilient, pruneEmptyParents } from './vaultio';
 import { PairingClient, PairResult, PAIRING_PROTOCOL_ACTION, parsePairingParams } from './pairing';
@@ -13,6 +13,7 @@ import { MassChangeModal } from './massChangeModal';
 import { ConflictModal } from './conflictModal';
 import type { ConflictVault } from './conflicts';
 import { SyncLog, Throttle, LogEntry } from './synclog';
+import { ConfirmModal } from './confirmModal';
 
 // The full shape of what this plugin persists via loadData()/saveData() —
 // settings fields plus the sync engine's own state, stored together under
@@ -29,6 +30,7 @@ interface PluginData {
   exclude?: string[];
   syncState?: PersistedSyncState;
   syncLog?: LogEntry[];
+  paused?: boolean;
 }
 
 const AUTH_TOKEN_SECRET = 'auth-token';
@@ -47,6 +49,61 @@ export default class VaultSyncPlugin extends Plugin {
   // Mobile has no status bar or console, so failures surface as a Notice —
   // at most one per 10 minutes so a persistent error doesn't spam.
   private errorNotice = new Throttle(10 * 60 * 1000);
+  private dataWrites: Promise<void> = Promise.resolve();
+  private activeCycle: Promise<void> | null = null;
+  private stopping = false;
+  private needsInitialSync = false;
+  statusText = 'Idle';
+
+  private updateData(update: (current: PluginData) => PluginData): Promise<void> {
+    const next = (this.dataWrites ?? Promise.resolve()).catch(() => {}).then(async () => {
+      const current = pluginDataWithoutAuthToken((await this.loadData()) as PluginData | undefined);
+      await this.saveData(update(current));
+    });
+    this.dataWrites = next;
+    return next;
+  }
+
+  confirmAction(message: string, action: string): Promise<boolean> { return new ConfirmModal(this.app, message, action).wait(); }
+
+  async setPaused(paused: boolean): Promise<void> {
+    if (!paused && (!this.settings.serverUrl || !this.settings.authToken)) {
+      new Notice('Configure a connection first');
+      return;
+    }
+    this.settings.paused = paused;
+    await this.saveSettings();
+    if (paused) { await this.stopSync(); this.setStatus('paused'); }
+    else { await this.initEngine(); await this.startSyncLoop(); }
+  }
+
+  async syncNow(): Promise<void> {
+    if (this.settings.paused) { new Notice('Resume sync first'); return; }
+    if (!this.settings.serverUrl || !this.settings.authToken) { new Notice('Configure a connection first'); return; }
+    if (!this.engine) await this.initEngine();
+    if (this.needsInitialSync) await this.runInitialSync();
+    await this.engine.scanLocalChanges();
+    await this.runPull();
+  }
+
+  private async stopSync(): Promise<void> {
+    this.stopping = true;
+    window.clearInterval(this.pollIntervalId);
+    for (const timer of this.debounceMap.values()) window.clearTimeout(timer);
+    this.debounceMap.clear();
+    this.sseClient?.disconnect();
+    await this.engine?.stop();
+    await this.activeCycle;
+    await this.state?.flush();
+    await this.dataWrites;
+  }
+
+  restartPoll(): void {
+    window.clearInterval(this.pollIntervalId);
+    if (!this.settings.paused && !this.stopping && this.engine) {
+      this.pollIntervalId = window.setInterval(() => { void this.runPull(); }, this.settings.syncInterval * 1000);
+    }
+  }
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -62,6 +119,7 @@ export default class VaultSyncPlugin extends Plugin {
     });
 
     this.registerObsidianProtocolHandler(PAIRING_PROTOCOL_ACTION, this.handlePairingUri.bind(this));
+    if (this.settings.paused) { this.setStatus('paused'); return; }
 
     if (!this.settings.serverUrl || !this.settings.authToken) {
       new OnboardingModal(this.app, this).open();
@@ -73,24 +131,24 @@ export default class VaultSyncPlugin extends Plugin {
     // both blocks startup (a full pull can write hundreds of files) and races
     // Obsidian's not-yet-populated file/folder cache. onLayoutReady fires once
     // the vault is indexed, so file writes land cleanly and startup stays fast.
-    this.app.workspace.onLayoutReady(() => this.startSyncLoop());
+    this.app.workspace.onLayoutReady(() => {
+      void this.startSyncLoop().catch(e => { this.setStatus('error'); this.logError('startup', e); });
+    });
   }
 
   onunload(): void {
-    window.clearInterval(this.pollIntervalId);
-    this.sseClient?.disconnect();
+    void this.stopSync();
   }
 
   async saveSettings(): Promise<void> {
     this.persistAuthToken(this.settings.authToken);
-    const cur = pluginDataWithoutAuthToken((await this.loadData()) as PluginData | undefined);
     const { authToken: _memory, ...persisted } = this.settings;
-    await this.saveData({ ...cur, ...persisted });
+    await this.updateData(cur => ({ ...cur, ...persisted }));
   }
 
   private persistAuthToken(token: string): void {
     const secrets = this.app.secretStorage;
-    if (!secrets?.setSecret || !token) return;
+    if (!secrets?.setSecret) throw new Error('Obsidian 1.11.4 or newer is required to store credentials');
     secrets.setSecret(AUTH_TOKEN_SECRET, token);
   }
 
@@ -101,7 +159,7 @@ export default class VaultSyncPlugin extends Plugin {
     }
     if (!this.engine) await this.initEngine();
     const client = new SyncClient(this.settings.serverUrl, this.settings.authToken);
-    new ConflictModal(this.app, this.makeConflictVault(), client, this.state).open();
+    new ConflictModal(this.app, this.makeConflictVault(), client, this.state, action => this.engine.runExclusive(action)).open();
   }
 
   private makeConflictVault(): ConflictVault {
@@ -121,25 +179,28 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   async runInitialSync(): Promise<void> {
+    if (this.settings.paused) { new Notice('Resume sync first'); return; }
+    if (!this.settings.serverUrl || !this.settings.authToken) { new Notice('Configure a connection first'); return; }
     if (!this.engine) await this.initEngine();
     this.setStatus('syncing');
     try {
       const { skippedDeleted } = await this.engine.initialSync((path) => this.isExcluded(path));
-      this.setStatus('synced');
+      this.needsInitialSync = false;
+      this.setSettledStatus();
       new Notice('Initial sync complete');
       if (skippedDeleted.length > 0) {
-        // Not uploaded: the server had these deleted and the local copies are
-        // not newer. Say so, so nothing silently differs between devices.
+        // A tombstone always requires an explicit choice to restore a local copy.
         console.warn('[vault-sync] initial sync skipped files deleted on the server:', skippedDeleted);
         new Notice(
           `${skippedDeleted.length} local file(s) were deleted on the server and were not uploaded. ` +
-          'Delete them here too, or edit them to keep them.',
+          'Open the conflict panel to choose whether to restore them or keep the deletion.',
           10000,
         );
       }
     } catch (e) {
       this.setStatus('error');
       new Notice(`Initial sync failed: ${errorMessage(e)}`);
+      throw e;
     }
   }
 
@@ -153,9 +214,8 @@ export default class VaultSyncPlugin extends Plugin {
    * Handles an obsidian://vps-vault-sync pairing link. This is how an
    * unconfigured device (no serverUrl/authToken yet) gets set up: scanning the
    * QR from an already-paired device opens Obsidian and lands here with no
-   * manual field entry required. Runs a full initialSync (not just a pull) so
-   * that a device which already has local-only notes — e.g. created before
-   * pairing — gets them uploaded, not just server files downloaded.
+   * manual field entry required. The wizard reviews the destination and vault
+   * before the user explicitly connects and starts the initial sync.
    */
   private async handlePairingUri(params: ObsidianProtocolData): Promise<void> {
     const parsed = parsePairingParams(params);
@@ -163,7 +223,7 @@ export default class VaultSyncPlugin extends Plugin {
       new Notice('Invalid pairing link');
       return;
     }
-    await this.connectToServer(parsed.server, parsed.token);
+    new OnboardingModal(this.app, this, parsed).open();
   }
 
   /**
@@ -175,8 +235,13 @@ export default class VaultSyncPlugin extends Plugin {
    * place that defines what "connected" means.
    */
   async connectToServer(serverUrl: string, authToken: string): Promise<void> {
+    await this.stopSync();
+    if (this.settings.serverUrl !== serverUrl) {
+      await this.updateData(cur => ({ ...cur, syncState: undefined, syncLog: [] }));
+    }
     this.settings.serverUrl = serverUrl;
     this.settings.authToken = authToken;
+    this.settings.paused = false;
     await this.saveSettings();
     new Notice('Paired — starting sync');
     await this.initEngine();
@@ -204,23 +269,21 @@ export default class VaultSyncPlugin extends Plugin {
    *   connection is leaked.
    */
   private async startSyncLoop(): Promise<void> {
-    // Run the first pull to completion BEFORE attaching file listeners.
-    // Pull writes via the adapter, which fires Obsidian 'create'/'modify'
-    // events; if listeners were already live they'd push every pulled file
-    // straight back. The per-file echo guard in push() also covers this, but
-    // ordering avoids a pointless burst of no-op pushes at startup.
-    await this.runPull();
-
-    // Then send deletions made while the plugin wasn't listening (see
-    // SyncEngine.reconcileDeletions). Still before the listeners, so a file
-    // removed here can't also be reported by a 'delete' event.
-    await this.runReconcile();
-
+    if (this.settings.paused) return;
+    // Listen before network work so edits made during startup are queued.
+    // The engine serializes uploads and skips echoes of its own writes.
     if (!this.listenersRegistered) {
       this.listenersRegistered = true;
       this.registerEvent(this.app.vault.on('modify', this.onFileModify.bind(this)));
       this.registerEvent(this.app.vault.on('create', this.onFileModify.bind(this)));
       this.registerEvent(this.app.vault.on('delete', this.onFileDelete.bind(this)));
+      this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+        const moved = file instanceof TFile ? [file.path] : this.app.vault.getFiles().map(f => f.path).filter(p => p.startsWith(file.path + '/'));
+        for (const path of moved) {
+          this.onFileDelete({ path: oldPath + path.slice(file.path.length) });
+          this.onFileModify({ path });
+        }
+      }));
 
       if (Platform.isMobile) {
         this.registerDomEvent(activeDocument, 'visibilitychange', () => {
@@ -229,27 +292,29 @@ export default class VaultSyncPlugin extends Plugin {
       }
     }
 
-    window.clearInterval(this.pollIntervalId);
-    this.pollIntervalId = window.setInterval(
-      () => { this.runPull().catch(console.error); },
-      this.settings.syncInterval * 1000,
-    );
-
-    if (!Platform.isMobile) {
-      this.sseClient.connect();
+    try {
+      if (this.needsInitialSync) await this.runInitialSync();
+      await this.engine.scanLocalChanges();
+      await this.runPull();
+    } finally {
+      // A temporary startup failure must still leave a way to retry.
+      this.restartPoll();
+      if (!Platform.isMobile && !this.stopping) this.sseClient.connect();
     }
   }
 
   private async initEngine(): Promise<void> {
+    this.stopping = false;
     // Tear down any previously-connected SSE client before replacing it —
     // otherwise re-pairing to a different server (see startSyncLoop) leaks a
     // live connection to the old one.
     this.sseClient?.disconnect();
 
-    const saved = ((await this.loadData()) as PluginData | undefined)?.syncLog;
+    const persisted = (await this.loadData()) as PluginData | undefined;
+    this.needsInitialSync = persisted?.syncState?.cursor === undefined;
+    const saved = persisted?.syncLog;
     this.syncLog = new SyncLog(saved, async (entries) => {
-      const cur = pluginDataWithoutAuthToken((await this.loadData()) as PluginData | undefined);
-      await this.saveData({ ...cur, syncLog: entries });
+      await this.updateData(cur => ({ ...cur, syncLog: entries }));
     });
 
     const storage: StateStorage = {
@@ -258,8 +323,7 @@ export default class VaultSyncPlugin extends Plugin {
         return d?.syncState;
       },
       save: async (d: PersistedSyncState) => {
-        const cur = pluginDataWithoutAuthToken((await this.loadData()) as PluginData | undefined);
-        await this.saveData({ ...cur, syncState: d });
+        await this.updateData(cur => ({ ...cur, syncState: d }));
       },
     };
     const state = await createState(storage);
@@ -270,9 +334,9 @@ export default class VaultSyncPlugin extends Plugin {
     this.engine = new SyncEngine(client, vault, state, (path) => {
       new Notice(`Sync conflict: ${path}`);
       this.setStatus('conflict');
-    }, this.app.vault.configDir, (affected, known) => {
-      return new MassChangeModal(this.app, affected, known).waitForChoice();
-    }, this.syncLog);
+    }, this.app.vault.configDir, (affected, known, paths) => {
+      return new MassChangeModal(this.app, affected, known, paths).waitForChoice();
+    }, this.syncLog, path => this.isExcluded(path));
 
     this.sseClient = new SSEClient(
       this.settings.serverUrl,
@@ -287,6 +351,7 @@ export default class VaultSyncPlugin extends Plugin {
 
     return {
       readFile: async (path) => {
+        if (!isSafeVaultPath(path, vault.configDir)) throw new Error('Unsafe vault path');
         // getAbstractFileByPath (not the newer getFileByPath, which needs
         // Obsidian 1.5.7+) for compatibility with older mobile builds that
         // can't be updated past ~1.12.x.
@@ -295,6 +360,7 @@ export default class VaultSyncPlugin extends Plugin {
         return vault.readBinary(file);
       },
       writeFile: async (path, data) => {
+        if (!isSafeVaultPath(path, vault.configDir)) throw new Error('Unsafe vault path');
         // Write through the adapter to dodge Obsidian's startup cache lag
         // (otherwise sequential writes into one folder throw "already exists").
         // No cast needed: Vault's real `adapter` (DataAdapter) already
@@ -302,6 +368,7 @@ export default class VaultSyncPlugin extends Plugin {
         await writeFileResilient(vault, path, data);
       },
       deleteFile: async (path) => {
+        if (!isSafeVaultPath(path, vault.configDir)) throw new Error('Unsafe vault path');
         const file = vault.getAbstractFileByPath(path);
         // vault.trash (not the newer FileManager.trashFile, which needs
         // Obsidian 1.6.6+) for the same older-mobile-build reason. `false`
@@ -327,22 +394,24 @@ export default class VaultSyncPlugin extends Plugin {
   private debounceMap = new Map<string, number>();
 
   private onFileModify(file: { path: string }): void {
-    if (this.isExcluded(file.path)) return;
+    if (this.stopping || this.settings.paused || this.isExcluded(file.path) || !isSafeSyncPath(file.path, this.app.vault.configDir)) return;
+    this.state?.queue(file.path, 'upload').catch(console.error);
     window.clearTimeout(this.debounceMap.get(file.path));
     this.debounceMap.set(file.path, window.setTimeout(() => {
+      this.debounceMap.delete(file.path);
       this.runPush(file.path).catch(console.error);
     }, pushDebounceDelayMs(this.settings.pushDebounceSeconds)));
   }
 
   private onFileDelete(file: { path: string }): void {
-    if (this.isExcluded(file.path)) return;
+    if (this.stopping || this.settings.paused || this.isExcluded(file.path) || !isSafeSyncPath(file.path, this.app.vault.configDir)) return;
     // Cancel pending push debounce for this file
     const pending = this.debounceMap.get(file.path);
     if (pending !== undefined) {
       window.clearTimeout(pending);
       this.debounceMap.delete(file.path);
     }
-    this.engine?.pushDelete(file.path).catch((e) => {
+    this.state?.queue(file.path, 'delete').catch((e) => {
       console.error(e);
       this.logError(`delete "${file.path}"`, e);
     });
@@ -358,16 +427,27 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   private async runPull(): Promise<void> {
-    if (!this.engine) return;
+    if (this.activeCycle) return this.activeCycle;
+    this.activeCycle = this.runCycle().finally(() => { this.activeCycle = null; });
+    return this.activeCycle;
+  }
+
+  private async runCycle(): Promise<void> {
+    if (!this.engine || this.stopping || this.settings.paused) return;
     this.setStatus('syncing');
     try {
+      if (this.needsInitialSync) {
+        await this.runInitialSync();
+        await this.engine.scanLocalChanges();
+      }
       const r = await this.engine.pull();
-      this.lastPullAt = Date.now();
-      if (r.failed > 0) {
+      const retriesFailed = r.blocked ? 0 : await this.engine.retryPending();
+      if (r.failed === 0 && !r.blocked) this.lastPullAt = Date.now();
+      if (r.failed > 0 || retriesFailed > 0) {
         this.setStatus('error');
         this.notifyMobileError(`${r.failed} file(s) failed to sync. Details: plugin settings → Sync log.`);
       } else {
-        this.setStatus('synced');
+        if (r.blocked) this.setStatus('pending'); else this.setSettledStatus();
       }
     } catch (e) {
       this.setStatus('error');
@@ -387,11 +467,11 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   private async runPush(path: string): Promise<void> {
-    if (!this.engine) return;
+    if (!this.engine || this.settings?.paused) return;
     this.setStatus('syncing');
     try {
-      await this.engine.push(path);
-      this.setStatus('synced');
+      const result = await this.engine.push(path);
+      if (result?.conflict) this.setStatus('conflict'); else this.setSettledStatus();
     } catch (e) {
       this.setStatus('error');
       console.error(`Sync push error (${path}):`, e);
@@ -403,15 +483,25 @@ export default class VaultSyncPlugin extends Plugin {
     return this.settings.exclude.some(pat => matchGlob(pat, path));
   }
 
-  private setStatus(status: 'idle' | 'syncing' | 'synced' | 'error' | 'conflict'): void {
+  private setSettledStatus(): void {
+    if (this.settings?.paused) this.setStatus('paused');
+    else if (Object.keys(this.state?.conflicts ?? {}).length) this.setStatus('conflict');
+    else if (Object.keys(this.state?.pending ?? {}).length) this.setStatus('pending');
+    else this.setStatus('synced');
+  }
+
+  private setStatus(status: 'idle' | 'syncing' | 'synced' | 'error' | 'conflict' | 'pending' | 'paused'): void {
     const icons: Record<string, string> = {
       idle: '↕ idle',
       syncing: '↕ syncing…',
       synced: '↕ synced',
       error: '✗ sync error',
       conflict: '⚠ conflict',
+      pending: '↕ pending changes',
+      paused: '⏸ paused',
     };
-    this.statusBarItem.setText(icons[status]);
+    this.statusText = icons[status];
+    this.statusBarItem?.setText(icons[status]);
   }
 
   private async loadSettings(): Promise<void> {
@@ -428,6 +518,7 @@ export default class VaultSyncPlugin extends Plugin {
         data.pushDebounceSeconds ?? DEFAULT_SETTINGS.pushDebounceSeconds,
       ),
       exclude: data.exclude ?? defaultExcludePatterns(this.app.vault.configDir),
+      paused: data.paused ?? false,
     };
     // Always rewrite plugin data when a legacy token is present, even if
     // secretStorage cannot store it. The token stays in memory only.

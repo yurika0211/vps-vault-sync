@@ -2,7 +2,7 @@
   "id": "vps-vault-sync",
   "name": "VPS Vault Sync",
   "version": "0.1.0",
-  "minAppVersion": "1.4.0",
+  "minAppVersion": "1.11.4",
   "description": "Fast, reliable vault sync via a self-hosted server.",
   "author": "Valentin Britvich",
   "authorUrl": "https://github.com/PeoneEr",
