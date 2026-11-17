@@ -92,7 +92,7 @@ export class ConflictModal extends Modal {
     });
 
     const actions = row.createDiv();
-    actions.setCssStyles({ display: 'flex', gap: '8px', flexWrap: 'wrap', margin: '8px 0 16px' });
+    actions.addClass('vps-vault-sync-conflict-actions');
 
     const openBoth = actions.createEl('button', { text: 'Compare local and server' });
     openBoth.onclick = () => {

@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Fast self-hosted vault sync for Obsidian",
   "main": "main.js",
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24"
+  },
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",
@@ -15,9 +18,9 @@
     "@types/jest": "^29.5.12",
     "@types/node": "^20.12.12",
     "@typescript-eslint/parser": "^8.63.0",
-    "esbuild": "^0.21.3",
+    "esbuild": "^0.28.2",
     "eslint": "^9.39.4",
-    "eslint-plugin-obsidianmd": "^0.4.1",
+    "eslint-plugin-obsidianmd": "^0.6.0",
     "globals": "^17.7.0",
     "jest": "^29.7.0",
     "obsidian": "latest",
@@ -33,6 +36,13 @@
     "testMatch": [
       "**/__tests__/**/*.test.ts"
     ]
+  },
+  "overrides": {
+    "brace-expansion@1": "^1.1.22",
+    "moment": "^2.31.0",
+    "eslint-plugin-n": {
+      "minimatch": "^11.0.9"
+    }
   },
   "dependencies": {
     "qrcode-generator": "^2.0.4"

@@ -44,7 +44,7 @@ export class PairingModal extends Modal {
     const linkBox = contentEl.createEl('input', { type: 'text' });
     linkBox.value = uri;
     linkBox.readOnly = true;
-    linkBox.setCssStyles({ width: '100%' });
+    linkBox.addClass('vps-vault-sync-pairing-link');
 
     const copyButton = contentEl.createEl('button', { text: 'Copy link' });
     copyButton.onclick = () => {

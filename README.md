@@ -101,9 +101,10 @@ mkdir -p "$DEST"
 base="https://github.com/yurika0211/vps-vault-sync/releases/download/${TAG}"
 curl -fsSL -o "$DEST/main.js" "$base/main.js"
 curl -fsSL -o "$DEST/manifest.json" "$base/manifest.json"
+curl -fsSL -o "$DEST/styles.css" "$base/styles.css"
 ```
 
-`styles.css` is not part of the build. The release attaches it only if a later build emits it. Copy it into the same folder when the release lists it.
+Releases from this revision also include `styles.css`. Download it into the same plugin directory; it supplies modal layouts and is copied unchanged by the release workflow.
 
 Then enable **VPS Vault Sync** in Obsidian. Paste the server URL and the bootstrap token from the server log.
 
@@ -111,7 +112,7 @@ Then enable **VPS Vault Sync** in Obsidian. Paste the server URL and the bootstr
 
 1. Create an empty folder. Open it in Obsidian as a vault. Do not use an existing vault.
 2. Build the plugin: `cd plugin && npm install && npm run build`.
-3. Copy `plugin/main.js`, `plugin/manifest.json`, and `plugin/styles.css` if present into `<throwaway>/.obsidian/plugins/vps-vault-sync/`.
+3. Copy `plugin/main.js`, `plugin/manifest.json`, and `plugin/styles.css` into `<throwaway>/.obsidian/plugins/vps-vault-sync/`.
 4. In Obsidian, enable **VPS Vault Sync**.
 5. Paste the server URL (`http://127.0.0.1:8080` from the host) and the bootstrap token from the server log.
 
@@ -145,6 +146,8 @@ This is a single-owner server: every paired device can read/write the whole vaul
 The server admits two uploads at a time (excess returns `429`, retried by the client), with a 100 MiB per-file limit; uploads and downloads still buffer complete files. Incremental lookup uses a cached log and pages of at most 256 entries. The log cache still grows with history, index updates still rewrite `index.json`, and blob garbage collection/quotas are not implemented. Capacity follow-up: [issue #8](https://github.com/yurika0211/vps-vault-sync/issues/8). Durable mutation intents recover interrupted metadata commits; a storage error may return `503` for an operation that is later completed during recovery, so clients reconcile before retrying.
 
 ## Tests
+
+The build/test toolchain requires Node 20.19+, 22.13+, or 24+. This requirement applies to development tools, not Obsidian's embedded runtime. Dependency review notes and remaining upstream advisories: [plugin dependency audit](plugin/DEPENDENCIES.md).
 
 ```bash
 cd plugin
