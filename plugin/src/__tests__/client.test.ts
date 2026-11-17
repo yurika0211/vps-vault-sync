@@ -50,6 +50,12 @@ test('putFile detects conflict', async () => {
   expect(result.conflict).toBe(true);
 });
 
+test('putFile reads X-Current-Hash', async () => {
+  mockRequestUrl([{ status: 200, headers: { 'x-conflict': 'true', 'X-Current-Hash': 'canon' } }]);
+  const result = await client.putFile('notes/foo.md', new TextEncoder().encode('v2').buffer as ArrayBuffer, 'stale');
+  expect(result.currentHash).toBe('canon');
+});
+
 test('deleteFile sends base hash', async () => {
   mockRequestUrl([{ status: 200 }]);
   await client.deleteFile('notes/foo.md', 'hash-abc');

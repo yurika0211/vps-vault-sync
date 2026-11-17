@@ -1,7 +1,7 @@
 import { Notice, ObsidianProtocolData, Platform, Plugin, TFile } from 'obsidian';
 import { SyncSettings, SyncSettingTab, DEFAULT_SETTINGS, clampPushDebounceSeconds, pushDebounceDelayMs } from './settings';
 import { defaultExcludePatterns, matchGlob } from './util';
-import { createState, PersistedSyncState, StateStorage } from './state';
+import { createState, PersistedSyncState, StateStorage, SyncState } from './state';
 import { SyncClient } from './client';
 import { SyncEngine, VaultAdapter } from './engine';
 import { SSEClient } from './sse';
@@ -10,6 +10,8 @@ import { PairingClient, PairResult, PAIRING_PROTOCOL_ACTION, parsePairingParams 
 import { errorMessage } from './errors';
 import { OnboardingModal } from './onboardingWizard';
 import { MassChangeModal } from './massChangeModal';
+import { ConflictModal } from './conflictModal';
+import type { ConflictVault } from './conflicts';
 import { SyncLog, Throttle, LogEntry } from './synclog';
 
 // The full shape of what this plugin persists via loadData()/saveData() —
@@ -34,6 +36,7 @@ const AUTH_TOKEN_SECRET = 'auth-token';
 export default class VaultSyncPlugin extends Plugin {
   settings!: SyncSettings;
   private engine!: SyncEngine;
+  private state?: SyncState;
   private sseClient!: SSEClient;
   private statusBarItem!: HTMLElement;
   private pollIntervalId?: number;
@@ -51,6 +54,12 @@ export default class VaultSyncPlugin extends Plugin {
 
     this.statusBarItem = this.addStatusBarItem();
     this.setStatus('idle');
+
+    this.addCommand({
+      id: 'open-conflicts',
+      name: 'Open conflict panel',
+      callback: () => { void this.openConflictPanel(); },
+    });
 
     this.registerObsidianProtocolHandler(PAIRING_PROTOCOL_ACTION, this.handlePairingUri.bind(this));
 
@@ -83,6 +92,32 @@ export default class VaultSyncPlugin extends Plugin {
     const secrets = this.app.secretStorage;
     if (!secrets?.setSecret || !token) return;
     secrets.setSecret(AUTH_TOKEN_SECRET, token);
+  }
+
+  async openConflictPanel(): Promise<void> {
+    if (!this.settings.serverUrl || !this.settings.authToken) {
+      new Notice('Set a server URL and auth token first');
+      return;
+    }
+    if (!this.engine) await this.initEngine();
+    const client = new SyncClient(this.settings.serverUrl, this.settings.authToken);
+    new ConflictModal(this.app, this.makeConflictVault(), client, this.state).open();
+  }
+
+  private makeConflictVault(): ConflictVault {
+    const vault = this.app.vault;
+    const workspace = this.app.workspace;
+    return {
+      listAll: async () => vault.getFiles().map((file: TFile) => file.path),
+      readFile: (path) => this.makeVaultAdapter().readFile(path),
+      writeFile: (path, data) => this.makeVaultAdapter().writeFile(path, data),
+      deleteFile: (path) => this.makeVaultAdapter().deleteFile(path),
+      openFile: async (path) => {
+        const file = vault.getAbstractFileByPath(path);
+        if (!(file instanceof TFile)) throw new Error(`File not found: ${path}`);
+        await workspace.getLeaf(true).openFile(file);
+      },
+    };
   }
 
   async runInitialSync(): Promise<void> {
@@ -228,6 +263,7 @@ export default class VaultSyncPlugin extends Plugin {
       },
     };
     const state = await createState(storage);
+    this.state = state;
     const client = new SyncClient(this.settings.serverUrl, this.settings.authToken);
     const vault = this.makeVaultAdapter();
 

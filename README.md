@@ -111,6 +111,23 @@ Pairing links use `obsidian://vps-vault-sync?...`.
 
 Initial sync keeps the local file when hashes differ and writes the server bytes to `<stem>.conflict.<device>.<timestamp><ext>`.
 
+## Conflicts
+
+The plugin does not merge files and does not overwrite the canonical copy unless the upload's base hash still matches.
+
+A stale daily push leaves the server file as canonical and stores the incoming bytes as `<file>.conflict.<timestamp>.<ext>`. The response sets `X-Conflict: true` and `X-Current-Hash` to the canonical hash. Those markdown copies stay on the server; the sync engine does not pull them into the vault. `GET /changes` still lists them, and `GET /file/{path}` can read one copy.
+
+Initial sync writes a local sibling, `<stem>.conflict.<device>.<timestamp><ext>`, and leaves the original path holding the local bytes.
+
+Open **Open conflict panel** from the command palette, or **Conflicts** in plugin settings. Each row shows the original path, the conflict copy path, and which side is canonical.
+
+- **Open both** opens the original and a vault sibling. A server-only copy is named in a notice.
+- **Keep local** uploads the original path's current bytes with the server's current hash as `X-Base-Hash`. A mismatch leaves the canonical file unchanged.
+- **Keep server** uploads the conflict-copy bytes with that same matching base hash, then writes those bytes to the original path. A mismatch writes nothing.
+- **Dismiss** asks first, then deletes the conflict copy. The original path stays.
+
+Deleting a resolved sibling is allowed. A later ordinary push still needs a matching base hash.
+
 ## Tests
 
 ```bash

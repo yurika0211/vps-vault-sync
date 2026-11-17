@@ -36,7 +36,7 @@ export class SyncClient {
     return resp.arrayBuffer;
   }
 
-  async putFile(path: string, data: ArrayBuffer, baseHash: string): Promise<{ conflict: boolean }> {
+  async putFile(path: string, data: ArrayBuffer, baseHash: string): Promise<{ conflict: boolean; currentHash?: string }> {
     const resp = await requestUrl({
       url: `${this.serverUrl}/file/${encodeFilePath(path)}`,
       method: 'PUT',
@@ -45,7 +45,10 @@ export class SyncClient {
       throw: false,
     });
     if (resp.status >= 400) throw new Error(`putFile failed: ${resp.status}`);
-    return { conflict: getHeader(resp.headers, 'x-conflict') === 'true' };
+    return {
+      conflict: getHeader(resp.headers, 'x-conflict') === 'true',
+      currentHash: getHeader(resp.headers, 'x-current-hash'),
+    };
   }
 
   async deleteFile(path: string, baseHash: string): Promise<void> {

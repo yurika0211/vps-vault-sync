@@ -46,7 +46,16 @@ Pairs with the companion sync server: https://github.com/PeoneEr/self-hosted-vau
 Every upload carries a base hash of the file it was derived from. If the
 server's current version no longer matches that base hash, the incoming
 write is saved alongside the original as `<file>.conflict.<timestamp>.<ext>`
-instead of overwriting it — you resolve the conflict manually.
+instead of overwriting it. The plugin does not merge the two copies.
+
+**Settings → Conflicts**, or the **Open conflict panel** command, lists
+local `*.conflict.*` siblings and server copies from `GET /changes`. Each
+row shows the original path, the conflict copy, and which side is canonical.
+
+**Keep local** or **Keep server** uploads the chosen bytes only when
+`X-Base-Hash` still matches the canonical hash. A mismatch leaves the
+canonical file unchanged. **Dismiss** deletes the conflict copy after a
+confirm. It does not delete the original path.
 
 ## Requirements
 

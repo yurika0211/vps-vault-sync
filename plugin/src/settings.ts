@@ -115,6 +115,13 @@ export class SyncSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('Conflicts')
+      .setDesc('List local conflict siblings and server conflict copies. Choosing a side uploads only when the base hash still matches.')
+      .addButton(b => b
+        .setButtonText('Open conflict panel')
+        .onClick(() => { void this.plugin.openConflictPanel(); }));
+
+    new Setting(containerEl)
       .setName('Initial sync')
       .setDesc('Compare by content hash. Missing files are copied. If both copies differ, the local file stays and the server copy is written beside it as a conflict file.')
       .addButton(b => b
