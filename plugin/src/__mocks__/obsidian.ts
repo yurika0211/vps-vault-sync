@@ -1,3 +1,4 @@
+export class ItemView {}
 export class Modal {
   constructor(public app: any) {}
   open(): void {}

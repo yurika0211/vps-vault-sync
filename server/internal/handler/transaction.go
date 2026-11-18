@@ -28,7 +28,10 @@ func (h *Handler) ReadyError() error {
 	if h.recoveryErr != nil {
 		return h.recoveryErr
 	}
-	return h.recoverPending()
+	if err := h.recoverPending(); err != nil {
+		return err
+	}
+	return h.finishRestore()
 }
 
 func (h *Handler) loadPending() {

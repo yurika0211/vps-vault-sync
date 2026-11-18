@@ -48,12 +48,7 @@ server's current version no longer matches that base hash, the incoming
 write is saved alongside the original as `<file>.conflict.<timestamp>.<ext>`
 instead of overwriting it. The plugin does not merge the two copies.
 
-**Settings → Conflicts**, or the **Open conflict panel** command, lists
-local `*.conflict.*` siblings and server copies from `GET /conflicts`. Each
-row shows the original path, the conflict copy, and which side is canonical.
-
-**Keep local** uploads the current local bytes only when `X-Base-Hash` still matches the server. **Keep server** downloads the canonical server file, verifies its content hash, and writes it locally. The rejected upload copy is retained for recovery. **Compare local and server** shows text previews; nothing is merged automatically. Resolved copies are labelled and retained. **Dismiss** deletes the conflict copy after a
-confirm. It does not delete the original path.
+Open **全仓冲突** from the ribbon, command palette or settings for line-by-line comparison and per-file or vault-wide resolution. The losing version stays in the server's note history. **版本历史** opens vault snapshots; the file menu opens history for a single note. See the [sync and restore behavior](../README.md#conflict-resolution-and-vault-history) for clock handling, snapshot scope and recovery.
 
 ## Requirements
 

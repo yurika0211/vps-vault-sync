@@ -176,7 +176,7 @@ test('initialSync: uploads all when server is empty', async () => {
   expect(client.putFile).toHaveBeenCalledTimes(2);
 });
 
-test('initialSync: hash mismatch keeps local and writes a conflict sibling', async () => {
+test('initialSync: hash mismatch keeps the working file and references the remote version', async () => {
   const vault = makeVault({ 'notes/a.md': 'old local content' });
   const state = await createState(makeStorage({}));
   const serverContent = new TextEncoder().encode('server content').buffer as ArrayBuffer;
@@ -192,11 +192,7 @@ test('initialSync: hash mismatch keeps local and writes a conflict sibling', asy
   await engine.initialSync();
 
   expect(vault.writeFile).not.toHaveBeenCalledWith('notes/a.md', serverContent);
-  const written = (vault.writeFile as jest.Mock).mock.calls.map(c => c[0] as string);
-  expect(written.some(p => /^notes\/a\.conflict\.local\..+\.md$/.test(p))).toBe(true);
-  const conflictPath = written.find(p => p.includes('.conflict.local.'));
-  expect(conflictPath).toBeDefined();
-  expect(vault.writeFile).toHaveBeenCalledWith(conflictPath, serverContent);
+  expect(vault.writeFile).not.toHaveBeenCalled();
   expect(state.files['notes/a.md']).toBeUndefined();
   expect(state.conflicts['notes/a.md']).toBe('server-hash');
   expect(onConflict).toHaveBeenCalledWith('notes/a.md');
