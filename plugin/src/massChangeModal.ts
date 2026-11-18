@@ -41,7 +41,7 @@ export class MassChangeModal extends Modal {
     });
 
     const buttonRow = contentEl.createDiv();
-    buttonRow.setCssStyles({ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '12px' });
+    buttonRow.addClass('vps-vault-sync-mass-change-actions');
 
     const skipButton = buttonRow.createEl('button', { text: 'Skip this sync' });
     skipButton.onclick = () => {
