@@ -66,3 +66,27 @@ func TestInterruptedRestoreRecoversBeforeOtherRequests(t *testing.T) {
 	require.Len(t, snapshots, 2)
 	require.Equal(t, "恢复前 · baseline", snapshots[0].Name)
 }
+
+func TestMissingLosingBlobDoesNotResolveConflict(t *testing.T) {
+	dir := t.TempDir()
+	store := store.New(filepath.Join(dir, "vault"))
+	log := changelog.New(filepath.Join(dir, "changes"))
+	h := handler.New(store, log, sse.NewBroker(), newTokens(t, dir))
+	put := httptest.NewRequest("PUT", "/file/test.md", bytes.NewBufferString("original"))
+	put.Header.Set("Authorization", "Bearer "+testToken)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, put)
+	require.Equal(t, 200, w.Code)
+	hash, ok := store.GetHash("test.md")
+	require.True(t, ok)
+	require.NoError(t, os.Remove(filepath.Join(store.Root(), "blobs", hash[:2], hash[2:])))
+	req := httptest.NewRequest("POST", "/history/resolve/test.md?keep=local&local=&seq=1&remote="+hash, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	require.Equal(t, 503, w.Code)
+	actual, ok := store.GetHash("test.md")
+	require.True(t, ok)
+	require.Equal(t, hash, actual)
+	require.EqualValues(t, 1, log.Cursor())
+}

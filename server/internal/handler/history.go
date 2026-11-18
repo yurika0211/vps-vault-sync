@@ -300,7 +300,7 @@ func (h *Handler) finishRestore() error {
 			continue
 		}
 		if v.Hash != "" {
-			if _, err := h.store.ReadBlob(v.Hash); err != nil {
+			if err := h.verifyBlob(v.Hash); err != nil {
 				return err
 			}
 		}
@@ -390,7 +390,8 @@ func (h *Handler) revisions(p string) ([]revision, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range entries {
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
 		if e.Hash == "" || originOf(e) != p {
 			continue
 		}
@@ -409,8 +410,21 @@ func (h *Handler) revisions(p string) ([]revision, error) {
 	return revisions, nil
 }
 
-// Check the reviewed head under the mutation lock. Persist the losing bytes
-// (including a deletion marker) before accepting any canonical change.
+func (h *Handler) verifyBlob(hash string) error {
+	if hash == "" {
+		return nil
+	}
+	data, err := h.store.ReadBlob(hash)
+	if err != nil {
+		return err
+	}
+	if sha256hex(data) != hash {
+		return errors.New("stored content does not match its hash")
+	}
+	return nil
+}
+
+// Check the reviewed head and persist the losing version before replacing the canonical file.
 func (h *Handler) resolveConflict(w http.ResponseWriter, r *http.Request, data []byte) {
 	p := r.PathValue("path")
 	q := r.URL.Query()
@@ -444,6 +458,10 @@ func (h *Handler) resolveConflict(w http.ResponseWriter, r *http.Request, data [
 	case "server":
 	default:
 		http.Error(w, "invalid choice", 400)
+		return
+	}
+	if err = h.verifyBlob(loser.Hash); err != nil {
+		http.Error(w, "retained body unavailable", 503)
 		return
 	}
 	if loser.Hash != winner.Hash {
@@ -486,7 +504,7 @@ func (h *Handler) restoreVersion(w http.ResponseWriter, r *http.Request) {
 		if rev.Hash != req.Hash {
 			continue
 		}
-		if _, err = h.store.ReadBlob(rev.Hash); err != nil {
+		if err = h.verifyBlob(rev.Hash); err != nil {
 			http.Error(w, "version unavailable", 503)
 			return
 		}
@@ -509,6 +527,14 @@ func (h *Handler) archiveCopy(w http.ResponseWriter, r *http.Request, data []byt
 		http.Error(w, "invalid path", 400)
 		return
 	}
+	if sha256hex(data) != hash {
+		http.Error(w, "invalid copy", 400)
+		return
+	}
+	if _, err := h.store.PutBlob(data); err != nil || h.verifyBlob(hash) != nil {
+		http.Error(w, "archive failed verification", 503)
+		return
+	}
 	revisions, err := h.revisions(p)
 	if err != nil {
 		http.Error(w, "history unavailable", 503)
@@ -520,13 +546,7 @@ func (h *Handler) archiveCopy(w http.ResponseWriter, r *http.Request, data []byt
 			return
 		}
 	}
-	if sha256hex(data) != hash {
-		http.Error(w, "invalid copy", 400)
-		return
-	}
-	if _, err = h.store.PutBlob(data); err == nil {
-		err = h.commit(changelog.Entry{Path: conflictName(p), Original: p, TS: nowUnix(), Modified: editTime(r), Hash: hash, Action: "modified"})
-	}
+	err = h.commit(changelog.Entry{Path: conflictName(p), Original: p, TS: nowUnix(), Modified: editTime(r), Hash: hash, Action: "modified"})
 	if err != nil {
 		http.Error(w, "archive failed", 503)
 		return
