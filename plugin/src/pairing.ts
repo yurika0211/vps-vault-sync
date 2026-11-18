@@ -91,7 +91,17 @@ export interface PairingParams {
  */
 export function parsePairingParams(params: Record<string, string>): PairingParams | null {
   if (!params.server || !params.token) return null;
-  return { server: params.server, token: params.token, label: params.label };
+  const server = normalizeServerUrl(params.server);
+  if (!server || /[\r\n]/.test(params.token)) return null;
+  return { server, token: params.token.trim(), label: params.label };
+}
+
+export function normalizeServerUrl(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null;
+    return url.toString().replace(/\/+$/, '');
+  } catch { return null; }
 }
 
 /**
@@ -108,6 +118,7 @@ export function parsePastedPairingLink(text: string): PairingParams | null {
   } catch {
     return null;
   }
+  if (url.protocol !== 'obsidian:' || url.hostname !== PAIRING_PROTOCOL_ACTION || (url.pathname && url.pathname !== '/')) return null;
   const params: Record<string, string> = {};
   url.searchParams.forEach((value, key) => { params[key] = value; });
   return parsePairingParams(params);

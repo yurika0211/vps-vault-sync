@@ -14,6 +14,7 @@ export interface SyncSettings {
   syncInterval: number;
   pushDebounceSeconds: number;
   exclude: string[];
+  paused: boolean;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
@@ -22,6 +23,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   syncInterval: 30,
   pushDebounceSeconds: 2,
   exclude: [],
+  paused: false,
 };
 
 export const PUSH_DEBOUNCE_MIN_SECONDS = 0;
@@ -52,6 +54,21 @@ export class SyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    let serverUrl = this.plugin.settings.serverUrl;
+    let authToken = this.plugin.settings.authToken;
+
+    new Setting(containerEl).setName('Sync status').setDesc(this.plugin.statusText)
+      .addButton(b => b.setButtonText(this.plugin.settings.paused ? 'Resume sync' : 'Pause sync')
+        .onClick(async () => {
+          try { await this.plugin.setPaused(!this.plugin.settings.paused); }
+          catch (e) { new Notice(`Could not change sync state: ${errorMessage(e)}`); }
+          this.display();
+        }))
+      .addButton(b => b.setButtonText('Sync now / retry').onClick(async () => {
+        try { await this.plugin.syncNow(); }
+        catch (e) { new Notice(`Sync failed: ${errorMessage(e)}`); }
+        this.display();
+      }));
 
     new Setting(containerEl)
       .setName('Run setup wizard')
@@ -66,30 +83,41 @@ export class SyncSettingTab extends PluginSettingTab {
       .addText(t => t
         .setPlaceholder('https://')
         .setValue(this.plugin.settings.serverUrl)
-        .onChange(async v => {
-          this.plugin.settings.serverUrl = v.trim();
-          await this.plugin.saveSettings();
+        .onChange(v => {
+          serverUrl = v.trim();
         }));
 
     new Setting(containerEl)
       .setName('Auth token')
       .setDesc('Only needed for the first device — pair every device after that from the "devices" section below.')
-      .addText(t => t
+      .addText(t => { t.inputEl.type = 'password'; return t
         .setValue(this.plugin.settings.authToken)
-        .onChange(async v => {
-          this.plugin.settings.authToken = v.trim();
-          await this.plugin.saveSettings();
-        }));
+        .onChange(v => {
+          authToken = v.trim();
+        }); });
+
+    new Setting(containerEl).setName('Apply connection')
+      .setDesc('Review the destination and confirm before changing the active connection.')
+      .addButton(b => b.setButtonText('Review connection').onClick(() =>
+        new OnboardingModal(this.app, this.plugin, { server: serverUrl, token: authToken }).open()))
+      .addButton(b => b.setButtonText('Disconnect and clear token').onClick(async () => {
+        await this.plugin.setPaused(true);
+        this.plugin.settings.authToken = '';
+        await this.plugin.saveSettings();
+        this.display();
+      }));
 
     new Setting(containerEl)
       .setName('Sync interval (seconds)')
-      .setDesc('How often to poll the server. Changing this applies the next time the sync loop starts.')
+      .setDesc('How often to poll the server. Changes apply immediately.')
       .addSlider(s => s
         .setLimits(10, 300, 10)
         .setValue(this.plugin.settings.syncInterval)
+        .setDynamicTooltip()
         .onChange(async v => {
           this.plugin.settings.syncInterval = v;
           await this.plugin.saveSettings();
+          this.plugin.restartPoll();
         }));
 
     new Setting(containerEl)
@@ -107,7 +135,7 @@ export class SyncSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Exclude patterns')
       .setDesc('One glob per line. These files will not be synced.')
-      .addText(t => t
+      .addTextArea(t => t
         .setValue(this.plugin.settings.exclude.join('\n'))
         .onChange(async v => {
           this.plugin.settings.exclude = v.split('\n').map(s => s.trim()).filter(Boolean);
@@ -116,7 +144,7 @@ export class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Conflicts')
-      .setDesc('List local conflict siblings and server conflict copies. Choosing a side uploads only when the base hash still matches.')
+      .setDesc('Compare local and server versions, then choose which to keep. Recovery copies remain until you delete them.')
       .addButton(b => b
         .setButtonText('Open conflict panel')
         .onClick(() => { void this.plugin.openConflictPanel(); }));
@@ -126,7 +154,7 @@ export class SyncSettingTab extends PluginSettingTab {
       .setDesc('Compare by content hash. Missing files are copied. If both copies differ, the local file stays and the server copy is written beside it as a conflict file.')
       .addButton(b => b
         .setButtonText('Start initial sync')
-        .onClick(() => this.plugin.runInitialSync()));
+        .onClick(() => this.plugin.runInitialSync().catch(() => {})));
 
     new Setting(containerEl).setName('Devices').setHeading();
 
@@ -222,6 +250,7 @@ export class SyncSettingTab extends PluginSettingTab {
           // rule override.
           .setWarning()
           .onClick(async () => {
+            if (!await this.plugin.confirmAction(`Revoke device "${device.label}"? It will lose access.`, 'Revoke')) return;
             try {
               await client.revokeDevice(device.id);
               await this.renderDevices(container);

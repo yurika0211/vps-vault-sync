@@ -4,16 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/audit"
@@ -33,18 +32,25 @@ type Handler struct {
 	mux       *http.ServeMux
 
 	// audit is optional (nil disables journaling); see WithAudit.
-	audit      *audit.Log
-	trustProxy bool
-	admin      adminAuth
+	audit       *audit.Log
+	trustProxy  bool
+	admin       adminAuth
+	mutationMu  sync.Mutex
+	pending     *changelog.Entry
+	recoveryErr error
+	uploadSlots chan struct{}
 }
 
 // New constructs a Handler and registers all routes.
 func New(s *store.Store, cl *changelog.Changelog, broker *sse.Broker, ts *tokens.Store) *Handler {
-	h := &Handler{store: s, changelog: cl, sse: broker, tokens: ts}
+	h := &Handler{store: s, changelog: cl, sse: broker, tokens: ts, uploadSlots: make(chan struct{}, 2)}
+	h.loadPending()
 	h.mux = http.NewServeMux()
 	h.mux.HandleFunc("GET /health", h.handleHealth)
 	h.mux.HandleFunc("GET /changes", h.withAuth(h.counted("GET /changes", h.handleChanges)))
 	h.mux.HandleFunc("GET /file/{path...}", h.withAuth(h.counted("GET /file", h.handleGetFile)))
+	h.mux.HandleFunc("GET /file-info/{path...}", h.withAuth(h.handleFileInfo))
+	h.mux.HandleFunc("GET /conflicts", h.withAuth(h.handleConflicts))
 	h.mux.HandleFunc("PUT /file/{path...}", h.withAuth(h.logged(audit.FilePut, h.handlePutFile)))
 	h.mux.HandleFunc("DELETE /file/{path...}", h.withAuth(h.logged(audit.FileDelete, h.handleDeleteFile)))
 	h.mux.HandleFunc("GET /events", h.withAuth(h.streamLogged(h.handleEvents)))
@@ -224,10 +230,34 @@ func (h *Handler) clientIP(r *http.Request) string {
 
 // handleChanges returns changelog entries newer than the given ?since= Unix timestamp.
 func (h *Handler) handleChanges(w http.ResponseWriter, r *http.Request) {
+	h.mutationMu.Lock()
+	if !h.ready(w) {
+		h.mutationMu.Unlock()
+		return
+	}
+	if value, ok := r.URL.Query()["cursor"]; ok {
+		cursor, err := strconv.ParseInt(value[0], 10, 64)
+		if err != nil {
+			h.mutationMu.Unlock()
+			http.Error(w, "invalid cursor", 400)
+			return
+		}
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		page, err := h.changelog.PageAfter(cursor, limit)
+		h.mutationMu.Unlock()
+		if err != nil {
+			http.Error(w, err.Error(), 409)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(page)
+		return
+	}
 	sinceStr := r.URL.Query().Get("since")
 	since, _ := strconv.ParseInt(sinceStr, 10, 64)
 
 	entries, err := h.changelog.Since(since)
+	h.mutationMu.Unlock()
 	if err != nil {
 		http.Error(w, "changelog error", http.StatusInternalServerError)
 		return
@@ -240,17 +270,70 @@ func (h *Handler) handleChanges(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleGetFile(w http.ResponseWriter, r *http.Request) {
+	h.mutationMu.Lock()
+	if !h.ready(w) {
+		h.mutationMu.Unlock()
+		return
+	}
 	path := r.PathValue("path")
-	data, err := h.store.ReadFile(path)
+	hash := r.URL.Query().Get("hash")
+	if hash == "" {
+		hash, _ = h.store.GetHash(path)
+	}
+	h.mutationMu.Unlock()
+	// Blobs are immutable; a slow download must not hold the mutation lock.
+	data, err := h.store.ReadBlob(hash)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	w.Header().Set("X-Content-Hash", sha256hex(data))
 	w.Write(data)
 }
 
-func (h *Handler) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleFileInfo(w http.ResponseWriter, r *http.Request) {
+	h.mutationMu.Lock()
+	if !h.ready(w) {
+		h.mutationMu.Unlock()
+		return
+	}
 	path := r.PathValue("path")
+	if hash, ok := h.store.GetHash(path); ok {
+		h.mutationMu.Unlock()
+		writeJSON(w, map[string]string{"path": path, "hash": hash, "action": "modified"})
+		return
+	}
+	e, ok := h.changelog.Latest(path)
+	h.mutationMu.Unlock()
+	if ok {
+		writeJSON(w, e)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (h *Handler) handleConflicts(w http.ResponseWriter, r *http.Request) {
+	h.mutationMu.Lock()
+	if !h.ready(w) {
+		h.mutationMu.Unlock()
+		return
+	}
+	entries := h.changelog.Conflicts()
+	h.mutationMu.Unlock()
+	writeJSON(w, entries)
+}
+
+func (h *Handler) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	h.mutationMu.Lock()
+	defer h.mutationMu.Unlock()
+	if !h.ready(w) {
+		return
+	}
+	path := r.PathValue("path")
+	if !validPath(path) {
+		http.Error(w, "invalid path", 400)
+		return
+	}
 	baseHash := r.Header.Get("X-Base-Hash")
 
 	currentHash, exists := h.store.GetHash(path)
@@ -259,27 +342,42 @@ func (h *Handler) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.DeleteFile(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		http.Error(w, "delete failed", http.StatusInternalServerError)
+	if !exists {
+		http.NotFound(w, r)
 		return
 	}
-
-	_ = h.changelog.Append(changelog.Entry{TS: nowUnix(), Path: path, Action: "deleted"})
+	if err := h.commit(changelog.Entry{TS: nowUnix(), Path: path, Action: "deleted"}); err != nil {
+		http.Error(w, "delete commit failed", 503)
+		return
+	}
 	h.sse.Publish(sse.Event{Path: path, Action: "deleted"})
 }
 
 func (h *Handler) handlePutFile(w http.ResponseWriter, r *http.Request) {
 	path := r.PathValue("path")
+	if !validPath(path) {
+		http.Error(w, "invalid path", 400)
+		return
+	}
 	baseHash := r.Header.Get("X-Base-Hash")
+	select {
+	case h.uploadSlots <- struct{}{}:
+		defer func() { <-h.uploadSlots }()
+	default:
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "upload capacity reached", 429)
+		return
+	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 100 MB cap
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "request too large or unreadable", http.StatusBadRequest)
+		return
+	}
+	h.mutationMu.Lock()
+	defer h.mutationMu.Unlock()
+	if !h.ready(w) {
 		return
 	}
 
@@ -300,28 +398,33 @@ func (h *Handler) handlePutFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if exists && currentHash != baseHash {
+	// A non-empty base for a now-deleted path is stale, too. Do not resurrect it.
+	if (exists && currentHash != baseHash) || (!exists && baseHash != "") {
 		conflictPath := conflictName(path)
-		if err := h.store.WriteFile(conflictPath, data); err != nil {
+		if _, err := h.store.PutBlob(data); err != nil {
 			http.Error(w, "store conflict", http.StatusInternalServerError)
 			return
 		}
-		_ = h.changelog.Append(changelog.Entry{TS: now, Path: conflictPath, Hash: newHash, Action: "modified"})
+		if err := h.commit(changelog.Entry{TS: now, Path: conflictPath, Hash: newHash, Action: "modified"}); err != nil {
+			http.Error(w, "conflict commit failed", 503)
+			return
+		}
 		h.sse.Publish(sse.Event{Path: conflictPath, Hash: newHash, Action: "modified"})
 		w.Header().Set("X-Conflict", "true")
-		// Return the server's current canonical hash so the client can update its
-		// base-hash state immediately. Without this the client retains the stale
-		// X-Base-Hash and every subsequent push hits this branch again, creating
-		// an unbounded conflict-copy storm.
+		// Report the canonical version for conflict resolution. The client keeps
+		// its original base and blocks automatic retries until the user chooses.
 		w.Header().Set("X-Current-Hash", currentHash)
 		return
 	}
 
-	if err := h.store.WriteFile(path, data); err != nil {
+	if _, err := h.store.PutBlob(data); err != nil {
 		http.Error(w, "store file", http.StatusInternalServerError)
 		return
 	}
-	_ = h.changelog.Append(changelog.Entry{TS: now, Path: path, Hash: newHash, Action: "modified"})
+	if err := h.commit(changelog.Entry{TS: now, Path: path, Hash: newHash, Action: "modified"}); err != nil {
+		http.Error(w, "file commit failed", 503)
+		return
+	}
 	h.sse.Publish(sse.Event{Path: path, Hash: newHash, Action: "modified"})
 	w.Header().Set("X-Conflict", "false")
 	w.Header().Set("X-Current-Hash", newHash)
@@ -353,6 +456,7 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	ch, unsub := h.sse.Subscribe()
+	revoked := h.tokens.Revoked(deviceID(r))
 	defer unsub()
 
 	// Flush an initial comment so the client receives the response head
@@ -368,10 +472,17 @@ func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
+		case <-revoked:
+			return
 		case <-ticker.C:
 			fmt.Fprint(w, ": ping\n\n")
 			flusher.Flush()
 		case event, ok := <-ch:
+			select {
+			case <-revoked:
+				return
+			default:
+			}
 			if !ok {
 				return
 			}

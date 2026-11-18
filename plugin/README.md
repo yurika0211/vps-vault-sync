@@ -2,9 +2,9 @@
 
 Fast, reliable Obsidian vault sync backed by your own sync server — a lightweight
 self-hosted alternative to Obsidian Sync / obsidian-livesync, with no vendor
-lock-in and no vault size limits beyond your own storage.
+lock-in. See the repository guide for file-size and storage-capacity limits.
 
-Pairs with the companion sync server: https://github.com/PeoneEr/self-hosted-vault-sync-server
+This fork requires the matching server in [`../server`](../server). Upgrade the server before the plugin; upstream releases do not implement this fork's sequence cursor API. See the [repository guide](../README.md) for deployment and compatibility.
 
 ## Features
 
@@ -21,7 +21,7 @@ Pairs with the companion sync server: https://github.com/PeoneEr/self-hosted-vau
 
 ## Setup
 
-1. Deploy the [sync server](https://github.com/PeoneEr/self-hosted-vault-sync-server)
+1. Deploy this repository's [sync server](../server)
    somewhere reachable from your devices. Its startup log prints a one-time
    **bootstrap token** — copy it.
 2. Install this plugin on your first device and enable it.
@@ -31,11 +31,11 @@ Pairs with the companion sync server: https://github.com/PeoneEr/self-hosted-vau
      this first device)
    - **Sync interval** — how often to poll for remote changes (seconds)
    - **Exclude patterns** — one glob per line for files to keep local-only
-4. Click **Start initial sync**.
+4. Click **Review connection**, check the server and current vault, then confirm. The wizard checks connectivity and starts initial sync. Use **Pause sync**, **Sync now / retry**, or **Disconnect and clear token** from settings as needed.
 5. To add another device (e.g. your phone): on this configured device,
    scroll to **Devices → Pair new device**, give it a label, click
    **Generate**. Scan the QR code with the new device's camera — it opens
-   Obsidian and finishes setup automatically, no typing required. (A
+   Obsidian and opens the destination/vault confirmation screen. (A
    "Copy link" fallback is shown next to the QR if scanning isn't
    convenient.)
 6. Manage paired devices any time from the **Devices** list — each entry
@@ -49,17 +49,16 @@ write is saved alongside the original as `<file>.conflict.<timestamp>.<ext>`
 instead of overwriting it. The plugin does not merge the two copies.
 
 **Settings → Conflicts**, or the **Open conflict panel** command, lists
-local `*.conflict.*` siblings and server copies from `GET /changes`. Each
+local `*.conflict.*` siblings and server copies from `GET /conflicts`. Each
 row shows the original path, the conflict copy, and which side is canonical.
 
-**Keep local** or **Keep server** uploads the chosen bytes only when
-`X-Base-Hash` still matches the canonical hash. A mismatch leaves the
-canonical file unchanged. **Dismiss** deletes the conflict copy after a
+**Keep local** uploads the current local bytes only when `X-Base-Hash` still matches the server. **Keep server** downloads the canonical server file, verifies its content hash, and writes it locally. The rejected upload copy is retained for recovery. **Compare local and server** shows text previews; nothing is merged automatically. Resolved copies are labelled and retained. **Dismiss** deletes the conflict copy after a
 confirm. It does not delete the original path.
 
 ## Requirements
 
-- A running instance of the companion sync server
+- Obsidian 1.11.4 or newer (required for credential storage)
+- A running instance of this fork's updated sync server
 - `isDesktopOnly: false` — works on desktop and mobile, though real-time
   push (SSE) is desktop-only; mobile relies on polling plus a sync-on-focus
   trigger

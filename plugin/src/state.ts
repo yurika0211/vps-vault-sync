@@ -1,6 +1,14 @@
 export interface SyncState {
   lastSyncTimestamp: number;
   files: Record<string, string>;
+  cursor: number;
+  pending: Record<string, 'upload' | 'delete'>;
+  conflicts: Record<string, string>;
+  resolvedCopies: Record<string, boolean>;
+  resolveCopy(path: string): Promise<void>;
+  setCursor(cursor: number): Promise<void>;
+  queue(path: string, action: 'upload' | 'delete' | null): Promise<void>;
+  setConflict(path: string, hash: string | null): Promise<void>;
   // While true, the mutators below only change memory and mark the state
   // dirty; flush() writes it out. pull() applies hundreds of files in one go,
   // and persisting the whole hash map after every single one is what made it
@@ -18,6 +26,10 @@ export interface SyncState {
 export interface PersistedSyncState {
   lastSyncTimestamp?: number;
   files?: Record<string, string>;
+  cursor?: number;
+  pending?: Record<string, 'upload' | 'delete'>;
+  conflicts?: Record<string, string>;
+  resolvedCopies?: Record<string, boolean>;
 }
 
 export interface StateStorage {
@@ -28,6 +40,14 @@ export interface StateStorage {
 export async function createState(storage: StateStorage): Promise<SyncState> {
   const raw = await storage.load();
   let dirty = false;
+  let saves = Promise.resolve();
+  const save = (): Promise<void> => {
+    const data = { lastSyncTimestamp: state.lastSyncTimestamp, files: { ...state.files }, cursor: state.cursor,
+      pending: { ...state.pending }, conflicts: { ...state.conflicts }, resolvedCopies: { ...state.resolvedCopies } };
+    const next = saves.catch(() => {}).then(() => storage.save(data));
+    saves = next;
+    return next;
+  };
 
   const persist = async (): Promise<void> => {
     if (state.deferSaves) {
@@ -35,12 +55,20 @@ export async function createState(storage: StateStorage): Promise<SyncState> {
       return;
     }
     dirty = false;
-    await storage.save({ lastSyncTimestamp: state.lastSyncTimestamp, files: state.files });
+    try { await save(); } catch (e) { dirty = true; throw e; }
   };
 
   const state: SyncState = {
     lastSyncTimestamp: raw?.lastSyncTimestamp ?? 0,
-    files: raw?.files ?? {},
+    files: Object.assign(Object.create(null) as Record<string, string>, raw?.files),
+    cursor: raw?.cursor ?? 0,
+    pending: Object.assign(Object.create(null) as Record<string, 'upload' | 'delete'>, raw?.pending),
+    conflicts: Object.assign(Object.create(null) as Record<string, string>, raw?.conflicts),
+    resolvedCopies: Object.assign(Object.create(null) as Record<string, boolean>, raw?.resolvedCopies),
+    async resolveCopy(path) { state.resolvedCopies[path] = true; await persist(); },
+    async setCursor(cursor) { state.cursor = cursor; await persist(); },
+    async queue(path, action) { if ((state.pending[path] ?? null) === action) return; if (action) state.pending[path] = action; else delete state.pending[path]; await persist(); },
+    async setConflict(path, hash) { if (hash !== null) state.conflicts[path] = hash; else delete state.conflicts[path]; await persist(); },
     deferSaves: false,
     async setFileHash(path, hash) {
       state.files[path] = hash;
@@ -57,7 +85,7 @@ export async function createState(storage: StateStorage): Promise<SyncState> {
     async flush() {
       if (!dirty) return;
       dirty = false;
-      await storage.save({ lastSyncTimestamp: state.lastSyncTimestamp, files: state.files });
+      try { await save(); } catch (e) { dirty = true; throw e; }
     },
   };
   return state;

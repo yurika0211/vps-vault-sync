@@ -1,6 +1,6 @@
 import { App, ButtonComponent, Modal, Setting } from 'obsidian';
 import type VaultSyncPlugin from './main';
-import { HttpError, PairingClient, parsePastedPairingLink } from './pairing';
+import { HttpError, PairingClient, parsePastedPairingLink, normalizeServerUrl, PairingParams } from './pairing';
 import { errorMessage } from './errors';
 
 type WizardStep = 'choice' | 'new-server' | 'join-existing';
@@ -14,12 +14,13 @@ type WizardStep = 'choice' | 'new-server' | 'join-existing';
 export class OnboardingModal extends Modal {
   private step: WizardStep = 'choice';
 
-  constructor(app: App, private plugin: VaultSyncPlugin) {
+  constructor(app: App, private plugin: VaultSyncPlugin, private proposed?: PairingParams) {
     super(app);
   }
 
   onOpen(): void {
-    this.render();
+    if (this.proposed) this.renderConfirmation(this.proposed.server, this.proposed.token);
+    else this.render();
   }
 
   onClose(): void {
@@ -131,7 +132,8 @@ export class OnboardingModal extends Modal {
     connectButton: ButtonComponent,
     statusEl: HTMLElement,
   ): void {
-    if (!serverUrl || !authToken) {
+    const normalized = normalizeServerUrl(serverUrl);
+    if (!normalized || !authToken) {
       statusEl.setText('Fill in both fields first');
       return;
     }
@@ -139,15 +141,39 @@ export class OnboardingModal extends Modal {
     connectButton.setDisabled(true);
     statusEl.setText('Checking connection…');
 
-    new PairingClient(serverUrl, authToken).listDevices()
+    new PairingClient(normalized, authToken).listDevices()
       .then(async () => {
-        this.close();
-        await this.plugin.connectToServer(serverUrl, authToken);
+        this.renderConfirmation(normalized, authToken);
       })
       .catch((e: unknown) => {
         connectButton.setDisabled(false);
         statusEl.setText(this.classifyConnectionError(e));
       });
+  }
+
+  private renderConfirmation(serverUrl: string, authToken: string): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: 'Confirm vault connection' });
+    contentEl.createEl('p', { text: `Destination: ${serverUrl}` });
+    contentEl.createEl('p', { text: `Vault: ${this.app.vault.getName()}. Local notes will be uploaded and remote files downloaded. Different copies are kept for review.` });
+    if (this.plugin.settings.serverUrl && this.plugin.settings.serverUrl !== serverUrl) {
+      contentEl.createEl('p', { text: `This replaces the connection to ${this.plugin.settings.serverUrl}. Only continue if this vault belongs on the new server.` });
+    }
+    if (serverUrl.startsWith('http://')) contentEl.createEl('p', { text: 'This address uses unencrypted HTTP. Use it only over a trusted private tunnel or localhost.' });
+    const status = contentEl.createEl('p');
+    new Setting(contentEl)
+      .addButton(b => b.setButtonText('Cancel').onClick(() => this.close()))
+      .addButton(b => b.setButtonText('Connect and sync this vault').setCta().onClick(async () => {
+        const normalized = normalizeServerUrl(serverUrl);
+        if (!normalized || !authToken) { status.setText('Enter a valid server URL and token.'); return; }
+        b.setDisabled(true); status.setText('Checking connection and syncing…');
+        try {
+          await new PairingClient(normalized, authToken).listDevices();
+          await this.plugin.connectToServer(normalized, authToken);
+          this.close();
+        } catch (e) { b.setDisabled(false); status.setText(this.classifyConnectionError(e)); }
+      }));
   }
 
   private classifyConnectionError(e: unknown): string {

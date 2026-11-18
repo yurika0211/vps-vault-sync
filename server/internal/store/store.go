@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/PeoneEr/self-hosted-vault-sync-server/internal/atomicfile"
 )
 
 // Store manages vault files using content-addressable blob storage.
@@ -18,14 +20,20 @@ type Store struct {
 	root string
 	mu   sync.RWMutex
 	idx  map[string]string // vault path → content sha256hex
+	err  error
 }
 
 func New(root string) *Store {
 	s := &Store{root: filepath.Clean(root), idx: make(map[string]string)}
-	_ = os.MkdirAll(filepath.Join(root, "blobs"), 0755)
-	_ = s.loadIndex()
+	s.err = os.MkdirAll(filepath.Join(root, "blobs"), 0755)
+	if s.err == nil {
+		s.err = s.loadIndex()
+	}
 	return s
 }
+
+func (s *Store) Err() error   { return s.err }
+func (s *Store) Root() string { return s.root }
 
 func (s *Store) blobPath(contentHash string) string {
 	return filepath.Join(s.root, "blobs", contentHash[:2], contentHash[2:])
@@ -43,7 +51,23 @@ func (s *Store) loadIndex() error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &s.idx)
+	if err := json.Unmarshal(data, &s.idx); err != nil {
+		return err
+	}
+	if s.idx == nil {
+		return fmt.Errorf("invalid null index")
+	}
+	for _, hash := range s.idx {
+		if len(hash) != 64 {
+			return fmt.Errorf("invalid content hash in index")
+		}
+		for _, c := range hash {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				return fmt.Errorf("invalid content hash in index")
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) saveIndex() error {
@@ -51,7 +75,7 @@ func (s *Store) saveIndex() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.indexPath(), data, 0644)
+	return atomicfile.Write(s.indexPath(), data, 0600)
 }
 
 func (s *Store) GetHash(path string) (string, bool) {
@@ -71,19 +95,70 @@ func (s *Store) ReadFile(path string) ([]byte, error) {
 	return os.ReadFile(s.blobPath(h))
 }
 
+func (s *Store) ReadBlob(hash string) ([]byte, error) {
+	if len(hash) != 64 {
+		return nil, fmt.Errorf("invalid content hash")
+	}
+	for _, c := range hash {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return nil, fmt.Errorf("invalid content hash")
+		}
+	}
+	return os.ReadFile(s.blobPath(hash))
+}
+
 func (s *Store) WriteFile(path string, data []byte) error {
+	h, err := s.PutBlob(data)
+	if err != nil {
+		return err
+	}
+	return s.SetHash(path, h)
+}
+
+// PutBlob prepares immutable content before committing its metadata.
+func (s *Store) PutBlob(data []byte) (string, error) {
+	if s.err != nil {
+		return "", s.err
+	}
 	h := sha256hex(data)
 	bp := s.blobPath(h)
+	if _, err := os.Stat(bp); err == nil {
+		return h, nil
+	}
 	if err := os.MkdirAll(filepath.Dir(bp), 0755); err != nil {
-		return err
+		return "", err
 	}
-	if err := os.WriteFile(bp, data, 0644); err != nil {
-		return err
+	if err := atomicfile.SyncDir(filepath.Join(s.root, "blobs")); err != nil {
+		return "", err
 	}
+	if err := atomicfile.Write(bp, data, 0600); err != nil {
+		return "", err
+	}
+	return h, nil
+}
+
+// SetHash installs an already prepared blob; empty hash means deletion.
+func (s *Store) SetHash(path, h string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.idx[path] = h
-	return s.saveIndex()
+	if s.err != nil {
+		return s.err
+	}
+	old, existed := s.idx[path]
+	if h == "" {
+		delete(s.idx, path)
+	} else {
+		s.idx[path] = h
+	}
+	if err := s.saveIndex(); err != nil {
+		if existed {
+			s.idx[path] = old
+		} else {
+			delete(s.idx, path)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) DeleteFile(path string) error {
@@ -92,8 +167,13 @@ func (s *Store) DeleteFile(path string) error {
 	if _, ok := s.idx[path]; !ok {
 		return os.ErrNotExist
 	}
+	old := s.idx[path]
 	delete(s.idx, path)
-	return s.saveIndex()
+	if err := s.saveIndex(); err != nil {
+		s.idx[path] = old
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ListAll() ([]string, error) {

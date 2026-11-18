@@ -24,6 +24,8 @@ export interface ConflictItem {
    * Initial-sync siblings: the local original stayed canonical and the sibling holds the server bytes.
    */
   canonical: 'server' | 'local-file';
+  remoteDeleted?: boolean;
+  localDeleted?: boolean;
 }
 
 export interface ConflictVault {
@@ -39,6 +41,7 @@ export interface ConflictClient {
   getFile(path: string): Promise<ArrayBuffer>;
   putFile(path: string, data: ArrayBuffer, baseHash: string): Promise<{ conflict: boolean; currentHash?: string }>;
   deleteFile(path: string, baseHash: string): Promise<void>;
+  getFileInfo?(path: string): Promise<{ hash: string; action: string } | null>;
 }
 
 export type ConflictActionResult =
@@ -131,17 +134,17 @@ function sortConflicts(items: ConflictItem[]): ConflictItem[] {
 /**
  * Lists known conflicts without pushing or pulling.
  * Local siblings come from the vault listing. Remote copies come from
- * GET /changes since 0 — the same changelog the engine already reads.
+ * GET /conflicts, without scanning the complete history on each action.
  * Markdown conflict copies are not in the vault because the engine skips them.
  */
 export async function listConflicts(
   vault: Pick<VaultAdapter, 'listAll'>,
-  client: Pick<SyncClient, 'getChanges'>,
+  client: Pick<SyncClient, 'getChanges'> & Partial<Pick<SyncClient, 'getConflicts'>>,
 ): Promise<{ items: ConflictItem[]; remoteError?: string }> {
   const paths = await vault.listAll();
   const local = listVaultConflicts(paths);
   try {
-    const remote = listRemoteConflicts(await client.getChanges(0))
+    const remote = listRemoteConflicts(client.getConflicts ? await client.getConflicts() : await client.getChanges(0))
       .filter(item => !local.some(have => have.conflictPath === item.conflictPath));
     return { items: sortConflicts([...local, ...remote]) };
   } catch (e) {
@@ -159,20 +162,24 @@ export async function keepLocal(
   vault: Pick<ConflictVault, 'readFile'>,
   client: ConflictClient,
 ): Promise<ConflictActionResult> {
+  if (item.localDeleted) {
+    try {
+      const hash = await canonicalHash(client, item.originalPath);
+      if (hash !== null) await client.deleteFile(item.originalPath, hash);
+      return { ok: true, hash: '' };
+    } catch (e) { return { ok: false, reason: 'error', message: messageOf(e) }; }
+  }
   let data: ArrayBuffer;
   try {
     data = await vault.readFile(item.originalPath);
   } catch (e) {
     return { ok: false, reason: 'missing', message: messageOf(e) };
   }
-  const serverHash = await canonicalHash(client, item.originalPath);
-  if (serverHash === null) {
-    return { ok: false, reason: 'missing', message: `No canonical file for ${item.originalPath}` };
-  }
   const localHash = await sha256hex(data);
-  if (localHash === serverHash) return { ok: true, hash: localHash };
   try {
-    const result = await client.putFile(item.originalPath, data, serverHash);
+    const serverHash = await canonicalHash(client, item.originalPath);
+    if (localHash === serverHash) return { ok: true, hash: localHash };
+    const result = await client.putFile(item.originalPath, data, serverHash ?? '');
     if (result.conflict || (result.currentHash !== undefined && result.currentHash !== localHash)) {
       return {
         ok: false,
@@ -187,47 +194,41 @@ export async function keepLocal(
 }
 
 /**
- * Replace the local original with the bytes the user picked.
- * Server-side copies are downloaded. Local siblings are read from the vault.
- * The original is written only after a matching-base upload succeeds when a
- * canonical file already exists. A missing canonical file is created with an
- * empty base hash, which the server accepts only when the path is new.
+ * Replace the local original with current server bytes, checking both their
+ * identity and any intervening local edit before writing. Conflict siblings
+ * are recovery copies and never stand in for the canonical server version.
  */
 export async function keepServer(
   item: ConflictItem,
-  vault: Pick<ConflictVault, 'readFile' | 'writeFile'>,
+  vault: Pick<ConflictVault, 'readFile' | 'writeFile'> & Partial<Pick<ConflictVault, 'deleteFile'>>,
   client: ConflictClient,
 ): Promise<ConflictActionResult> {
-  let incoming: ArrayBuffer;
   try {
-    incoming = item.copyLocation === 'server'
-      ? await client.getFile(item.conflictPath)
-      : await vault.readFile(item.conflictPath);
-  } catch (e) {
-    return { ok: false, reason: 'missing', message: messageOf(e) };
-  }
-  const incomingHash = await sha256hex(incoming);
-
-  const serverHash = await canonicalHash(client, item.originalPath);
-  try {
-    const result = await client.putFile(item.originalPath, incoming, serverHash ?? '');
-    if (result.conflict || (result.currentHash !== undefined && result.currentHash !== incomingHash)) {
-      return {
-        ok: false,
-        reason: 'base-mismatch',
-        message: `Canonical hash did not match. ${item.originalPath} was not overwritten.`,
-      };
+    const before = await vault.readFile(item.originalPath).catch(() => null);
+    const serverHash = await canonicalHash(client, item.originalPath);
+    if (serverHash === null) {
+      if (!item.remoteDeleted || !vault.deleteFile) return { ok: false, reason: 'missing', message: 'The server file no longer exists. Refresh the conflict panel.' };
+      const after = await vault.readFile(item.originalPath).catch(() => null);
+      if ((before === null) !== (after === null) || (before && after && await sha256hex(before) !== await sha256hex(after))) {
+        return { ok: false, reason: 'base-mismatch', message: 'Local file changed while resolving. Review the latest edits and retry.' };
+      }
+      await vault.deleteFile(item.originalPath);
+      return { ok: true, hash: '' };
     }
-  } catch (e) {
-    return { ok: false, reason: 'error', message: messageOf(e) };
-  }
-
-  try {
+    // Server conflict copies contain rejected client bytes, not canonical
+    // server bytes. Read the original path and verify its current identity.
+    const incoming = await client.getFile(item.originalPath);
+    const incomingHash = await sha256hex(incoming);
+    if (incomingHash !== serverHash) return { ok: false, reason: 'base-mismatch', message: 'Server file changed during download. Refresh and retry.' };
+    const after = await vault.readFile(item.originalPath).catch(() => null);
+    if ((before === null) !== (after === null) || (before && after && await sha256hex(before) !== await sha256hex(after))) {
+      return { ok: false, reason: 'base-mismatch', message: 'Local file changed while resolving. Review the latest edits and retry.' };
+    }
     await vault.writeFile(item.originalPath, incoming);
+    return { ok: true, hash: incomingHash };
   } catch (e) {
     return { ok: false, reason: 'error', message: messageOf(e) };
   }
-  return { ok: true, hash: incomingHash };
 }
 
 /** Delete one conflict copy. Does not touch the original path. */
@@ -248,7 +249,8 @@ export async function dismissConflict(
   }
 }
 
-async function canonicalHash(client: Pick<ConflictClient, 'getChanges'>, path: string): Promise<string | null> {
+async function canonicalHash(client: Pick<ConflictClient, 'getChanges' | 'getFileInfo'>, path: string): Promise<string | null> {
+  if (client.getFileInfo) { const info = await client.getFileInfo(path); return info?.action === 'modified' ? info.hash : null; }
   const changes = await client.getChanges(0);
   return latestLiveChanges(changes).get(path) ?? null;
 }

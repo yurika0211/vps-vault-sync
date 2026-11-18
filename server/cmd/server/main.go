@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -62,6 +63,9 @@ func main() {
 
 	h := handler.New(s, cl, broker, tokenStore).
 		WithAudit(auditLog, os.Getenv("TRUST_PROXY_HEADERS") == "true")
+	if err := h.ReadyError(); err != nil {
+		log.Fatalf("recover sync metadata: %v", err)
+	}
 	// ADMIN_TOKEN enables the /admin UI. It is a separate secret from device
 	// tokens and opens nothing but /admin/api/*. Unset = admin disabled (404).
 	if adminToken := os.Getenv("ADMIN_TOKEN"); adminToken != "" {
@@ -70,7 +74,7 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:        ":" + port,
+		Addr:        net.JoinHostPort(os.Getenv("BIND_HOST"), port),
 		Handler:     h,
 		ReadTimeout: 30 * time.Second,
 		IdleTimeout: 120 * time.Second,

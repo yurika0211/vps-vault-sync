@@ -23,11 +23,12 @@ test('clampPushDebounceSeconds clamps negatives and non-integers into 0..30', ()
 });
 
 beforeEach(() => {
-  (globalThis as unknown as { window: typeof globalThis }).window = globalThis as unknown as Window & typeof globalThis;
+  (global as unknown as { window: typeof global }).window = global as unknown as Window & typeof global;
 });
 
 function barePlugin(seconds: number): VaultSyncPlugin {
   const plugin = Object.create(VaultSyncPlugin.prototype) as VaultSyncPlugin;
+  Object.assign(plugin, { app: { vault: { configDir: '.obsidian' } } });
   plugin.settings = { ...DEFAULT_SETTINGS, pushDebounceSeconds: seconds, exclude: [] };
   (plugin as unknown as { debounceMap: Map<string, number> }).debounceMap = new Map();
   (plugin as unknown as { runPush: (path: string) => Promise<void> }).runPush = jest.fn(async () => {});

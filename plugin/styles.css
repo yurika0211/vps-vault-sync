@@ -1,0 +1,17 @@
+.vps-vault-sync-conflict-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0 16px;
+}
+
+.vps-vault-sync-mass-change-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
+.vps-vault-sync-pairing-link {
+  width: 100%;
+}

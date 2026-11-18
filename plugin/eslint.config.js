@@ -40,6 +40,8 @@ export default defineConfig([
       '@typescript-eslint/no-unnecessary-type-assertion': 'off',
       '@typescript-eslint/no-unsafe-return': 'off',
       'obsidianmd/hardcoded-config-path': 'off',
+      // Node tests install a window/EventSource shim; they have no popout window.
+      'obsidianmd/no-global-this': 'off',
     },
   },
   {
@@ -60,7 +62,7 @@ export default defineConfig([
     files: ['src/settings.ts', 'src/main.ts', 'src/conflictModal.ts'],
     rules: {
       // trashFile()/setDestructive() need Obsidian 1.6.6+/1.13.0+; this
-      // plugin targets minAppVersion 1.4.0 so it still installs on mobile
+      // plugin targets minAppVersion 1.11.4 so it still installs on mobile
       // builds capped below 1.13 (see manifest.json / versions.json).
       'obsidianmd/prefer-file-manager-trash-file': 'off',
       '@typescript-eslint/no-deprecated': 'off',
@@ -85,6 +87,6 @@ export default defineConfig([
     },
   },
   {
-    ignores: ['main.js', 'esbuild.config.mjs', 'eslint.config.js', 'node_modules/**'],
+    ignores: ['main.js', 'esbuild.config.mjs', 'eslint.config.js', 'scripts/**/*.mjs', 'node_modules/**'],
   },
 ]);
