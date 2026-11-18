@@ -68,7 +68,16 @@ export async function createState(storage: StateStorage): Promise<SyncState> {
     async resolveCopy(path) { state.resolvedCopies[path] = true; await persist(); },
     async setCursor(cursor) { state.cursor = cursor; await persist(); },
     async queue(path, action) { if ((state.pending[path] ?? null) === action) return; if (action) state.pending[path] = action; else delete state.pending[path]; await persist(); },
-    async setConflict(path, hash) { if (hash !== null) state.conflicts[path] = hash; else delete state.conflicts[path]; await persist(); },
+    async setConflict(path, hash) {
+      const previous = state.conflicts[path];
+      if (hash !== null) state.conflicts[path] = hash;
+      else delete state.conflicts[path];
+      try { await persist(); }
+      catch (error) {
+        if (hash === null && previous) state.conflicts[path] = previous;
+        throw error;
+      }
+    },
     deferSaves: false,
     async setFileHash(path, hash) {
       state.files[path] = hash;

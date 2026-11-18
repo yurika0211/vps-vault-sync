@@ -151,7 +151,7 @@ export class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Initial sync')
-      .setDesc('Compare by content hash. Missing files are copied. If both copies differ, the local file stays and the server copy is written beside it as a conflict file.')
+      .setDesc('Compare by content hash. Missing files are copied. If both copies differ, the local file stays and the remote version remains available in the conflict view.')
       .addButton(b => b
         .setButtonText('Start initial sync')
         .onClick(() => this.plugin.runInitialSync().catch(() => {})));

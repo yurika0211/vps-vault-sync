@@ -120,24 +120,15 @@ The token is stored in Obsidian `secretStorage`, not in `data.json`. Server URL,
 
 Pairing links use `obsidian://vps-vault-sync?...`.
 
-Initial sync keeps the local file when hashes differ and writes the server bytes to `<stem>.conflict.<device>.<timestamp><ext>`.
+## Conflict resolution and vault history
 
-## Conflicts
+Upgrade the server first. Open **全仓冲突** in the ribbon to review local and remote changes, choose a side per file, or apply **一键使用最新修改** to the eligible notes in the vault. The command palette and plugin settings open the same view. A newer version has a distinct typeface and color. The server pins the discarded content before it commits a resolution. Concurrent changes and failed archives leave the note pending. Existing local conflict siblings migrate to server history when this view opens, with content verification before removal.
 
-The plugin does not merge files and does not overwrite the canonical copy unless the upload's base hash still matches.
+Uploads record the source file's stable modification time in milliseconds. Legacy uploads, deletions, missing timestamps, future timestamps and untrusted device clocks need a manual choice. Both devices must be within one minute of server time; timestamps within two minutes of each other are ambiguous at that tolerance. The server's change timestamp continues to drive legacy sync and history display.
 
-A stale daily push leaves the server file as canonical and stores the incoming bytes as `<file>.conflict.<timestamp>.<ext>`. The response sets `X-Conflict: true` and `X-Current-Hash` to the canonical hash. Those markdown copies stay on the server; the sync engine does not pull them into the vault. `GET /changes` still lists them, and `GET /file/{path}` can read one copy.
+**版本历史** in the ribbon opens vault snapshots. The file menu, note-history command and conflict view open the same page scoped to one file. Search by name or path, including deleted notes, in pages of five. Opening a revision downloads its immutable body on demand. Selecting **恢复此版本** applies it as a new change. Earlier content stays in the server's history.
 
-Initial sync writes a local sibling, `<stem>.conflict.<device>.<timestamp><ext>`, and leaves the original path holding the local bytes.
-
-Open **Open conflict panel** from the command palette, or **Conflicts** in plugin settings. Each row shows the original path, the conflict copy path, and which side is canonical.
-
-- **Compare local and server** previews the current versions, capped at 128 KiB each. Binary files are not rendered as a visual diff.
-- **Keep local** uploads the original path's current bytes with the server's current hash as `X-Base-Hash`. A mismatch leaves the canonical file unchanged.
-- **Keep server** downloads the current canonical server file and verifies its hash before writing locally. A rejected upload is never mistaken for server content. An explicit deletion conflict can also be resolved by keeping the server deletion.
-- **Dismiss** asks first, then deletes the conflict copy. The original path stays.
-
-Resolved copies remain available for recovery and are labelled accordingly; delete them explicitly when no longer needed. Automatic uploads for an unresolved path remain blocked.
+A named snapshot captures the server manifest after the initiating device has flushed pending changes. Disconnected devices contribute when they next sync. The restore preview enumerates files to replace, recover and remove. Confirmation checks the same server cursor, records a safety snapshot, then applies either one file or the whole manifest. A durable restore intent finishes interrupted operations before subsequent sync requests. Back up the entire server data directory, including the changelog, vault blobs, index and history catalog.
 
 ## Security and capacity boundaries
 

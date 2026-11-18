@@ -14,6 +14,9 @@ import (
 )
 
 type Entry struct {
+	Modified int64  `json:"modified,omitempty"` // device edit time, Unix milliseconds
+	Original string `json:"original,omitempty"` // canonical path of a retained conflict
+
 	TS     int64  `json:"ts"`
 	Path   string `json:"path"`
 	Hash   string `json:"hash"`
@@ -183,4 +186,10 @@ func (c *Changelog) Conflicts() []Entry {
 		}
 	}
 	return out
+}
+
+func (c *Changelog) Cursor() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return int64(len(c.entries))
 }

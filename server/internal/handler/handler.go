@@ -39,13 +39,16 @@ type Handler struct {
 	pending     *changelog.Entry
 	recoveryErr error
 	uploadSlots chan struct{}
+	history     historyCatalog
 }
 
 // New constructs a Handler and registers all routes.
 func New(s *store.Store, cl *changelog.Changelog, broker *sse.Broker, ts *tokens.Store) *Handler {
 	h := &Handler{store: s, changelog: cl, sse: broker, tokens: ts, uploadSlots: make(chan struct{}, 2)}
 	h.loadPending()
+	h.loadHistory()
 	h.mux = http.NewServeMux()
+	h.registerHistory()
 	h.mux.HandleFunc("GET /health", h.handleHealth)
 	h.mux.HandleFunc("GET /changes", h.withAuth(h.counted("GET /changes", h.handleChanges)))
 	h.mux.HandleFunc("GET /file/{path...}", h.withAuth(h.counted("GET /file", h.handleGetFile)))
@@ -77,7 +80,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-Base-Hash, Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-Base-Hash, X-Modified, X-Client-Time, Content-Type")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -299,8 +302,9 @@ func (h *Handler) handleFileInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.PathValue("path")
 	if hash, ok := h.store.GetHash(path); ok {
+		e, _ := h.changelog.Latest(path)
 		h.mutationMu.Unlock()
-		writeJSON(w, map[string]string{"path": path, "hash": hash, "action": "modified"})
+		writeJSON(w, map[string]any{"path": path, "hash": hash, "action": "modified", "seq": e.Seq, "modified": e.Modified, "serverTime": time.Now().UnixMilli()})
 		return
 	}
 	e, ok := h.changelog.Latest(path)
@@ -405,7 +409,7 @@ func (h *Handler) handlePutFile(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "store conflict", http.StatusInternalServerError)
 			return
 		}
-		if err := h.commit(changelog.Entry{TS: now, Path: conflictPath, Hash: newHash, Action: "modified"}); err != nil {
+		if err := h.commit(changelog.Entry{TS: now, Path: conflictPath, Original: path, Modified: editTime(r), Hash: newHash, Action: "modified"}); err != nil {
 			http.Error(w, "conflict commit failed", 503)
 			return
 		}
@@ -421,7 +425,7 @@ func (h *Handler) handlePutFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store file", http.StatusInternalServerError)
 		return
 	}
-	if err := h.commit(changelog.Entry{TS: now, Path: path, Hash: newHash, Action: "modified"}); err != nil {
+	if err := h.commit(changelog.Entry{TS: now, Path: path, Modified: editTime(r), Hash: newHash, Action: "modified"}); err != nil {
 		http.Error(w, "file commit failed", 503)
 		return
 	}

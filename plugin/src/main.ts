@@ -5,13 +5,13 @@ import { createState, PersistedSyncState, StateStorage, SyncState } from './stat
 import { SyncClient } from './client';
 import { SyncEngine, VaultAdapter, isSafeSyncPath, isSafeVaultPath } from './engine';
 import { SSEClient } from './sse';
-import { writeFileResilient, pruneEmptyParents } from './vaultio';
+import { ensureFolder, writeFileResilient, pruneEmptyParents } from './vaultio';
 import { PairingClient, PairResult, PAIRING_PROTOCOL_ACTION, parsePairingParams } from './pairing';
 import { errorMessage } from './errors';
 import { OnboardingModal } from './onboardingWizard';
 import { MassChangeModal } from './massChangeModal';
-import { ConflictModal } from './conflictModal';
-import type { ConflictVault } from './conflicts';
+import { CONFLICTS, HISTORY, ConflictsView, HistoryView } from './workspaceViews';
+import { WorkspaceActions } from './workspaceActions';
 import { SyncLog, Throttle, LogEntry } from './synclog';
 import { ConfirmModal } from './confirmModal';
 
@@ -112,6 +112,19 @@ export default class VaultSyncPlugin extends Plugin {
     this.statusBarItem = this.addStatusBarItem();
     this.setStatus('idle');
 
+    this.registerView(CONFLICTS, leaf => new ConflictsView(leaf,this));
+    this.registerView(HISTORY, leaf => new HistoryView(leaf,this));
+    this.addRibbonIcon('git-compare-arrows','全仓冲突',()=>{void this.openConflictPanel();});
+    this.addRibbonIcon('history','版本历史',()=>{void this.openHistory();});
+    this.addCommand({id:'open-note-history',name:'查看这篇笔记的历史',checkCallback:checking=>{
+      const file=this.app.workspace.getActiveFile();
+      if(!file)return false;
+      if(!checking)void this.openHistory(file.path);
+      return true;
+    }});
+    this.registerEvent(this.app.workspace.on('file-menu',(menu,file)=>{
+      if(file instanceof TFile)menu.addItem(item=>item.setTitle('查看这篇笔记的历史').setIcon('history').onClick(()=>this.openHistory(file.path)));
+    }));
     this.addCommand({
       id: 'open-conflicts',
       name: 'Open conflict panel',
@@ -152,30 +165,26 @@ export default class VaultSyncPlugin extends Plugin {
     secrets.setSecret(AUTH_TOKEN_SECRET, token);
   }
 
-  async openConflictPanel(): Promise<void> {
-    if (!this.settings.serverUrl || !this.settings.authToken) {
-      new Notice('Set a server URL and auth token first');
-      return;
-    }
-    if (!this.engine) await this.initEngine();
-    const client = new SyncClient(this.settings.serverUrl, this.settings.authToken);
-    new ConflictModal(this.app, this.makeConflictVault(), client, this.state, action => this.engine.runExclusive(action)).open();
+  workspaceActions(): WorkspaceActions {
+    if(!this.state || !this.engine || this.stopping || this.settings.paused)throw new Error('请先配置连接并启动同步。');
+    return new WorkspaceActions(new SyncClient(this.settings.serverUrl,this.settings.authToken),this.makeVaultAdapter(),
+      this.engine,this.state,path=>isSafeSyncPath(path,this.app.vault.configDir)&&!this.isExcluded(path));
   }
 
-  private makeConflictVault(): ConflictVault {
-    const vault = this.app.vault;
-    const workspace = this.app.workspace;
-    return {
-      listAll: async () => vault.getFiles().map((file: TFile) => file.path),
-      readFile: (path) => this.makeVaultAdapter().readFile(path),
-      writeFile: (path, data) => this.makeVaultAdapter().writeFile(path, data),
-      deleteFile: (path) => this.makeVaultAdapter().deleteFile(path),
-      openFile: async (path) => {
-        const file = vault.getAbstractFileByPath(path);
-        if (!(file instanceof TFile)) throw new Error(`File not found: ${path}`);
-        await workspace.getLeaf(true).openFile(file);
-      },
-    };
+  private async openWorkspace(type:string) {
+    const workspace=this.app.workspace;
+    const leaf=workspace.getLeavesOfType(type)[0]??workspace.getLeaf('tab');
+    await leaf.setViewState({type,active:true});
+    await workspace.revealLeaf(leaf);
+    return leaf.view;
+  }
+  async openConflictPanel() {
+    const view=await this.openWorkspace(CONFLICTS);
+    if(view instanceof ConflictsView)await view.refresh();
+  }
+  async openHistory(path='') {
+    const view=await this.openWorkspace(HISTORY);
+    if(view instanceof HistoryView)await view.show(path);
   }
 
   async runInitialSync(): Promise<void> {
@@ -334,6 +343,9 @@ export default class VaultSyncPlugin extends Plugin {
     this.engine = new SyncEngine(client, vault, state, (path) => {
       new Notice(`Sync conflict: ${path}`);
       this.setStatus('conflict');
+      for (const leaf of this.app.workspace.getLeavesOfType(CONFLICTS)) {
+        if (leaf.view instanceof ConflictsView) leaf.view.scheduleRefresh();
+      }
     }, this.app.vault.configDir, (affected, known, paths) => {
       return new MassChangeModal(this.app, affected, known, paths).waitForChoice();
     }, this.syncLog, path => this.isExcluded(path));
@@ -352,12 +364,30 @@ export default class VaultSyncPlugin extends Plugin {
     return {
       readFile: async (path) => {
         if (!isSafeVaultPath(path, vault.configDir)) throw new Error('Unsafe vault path');
-        // getAbstractFileByPath (not the newer getFileByPath, which needs
-        // Obsidian 1.5.7+) for compatibility with older mobile builds that
-        // can't be updated past ~1.12.x.
+        return vault.adapter.readBinary(path);
+      },
+      replaceReviewed: async (path, before, data) => {
+        if (!isSafeSyncPath(path, vault.configDir)) throw new Error('Unsafe vault path');
+        if (before === null) {
+          await ensureFolder(vault,path.split('/').slice(0,-1).join('/'));
+          await vault.createBinary(path,data);
+          return;
+        }
         const file = vault.getAbstractFileByPath(path);
-        if (!(file instanceof TFile)) throw new Error(`File not found: ${path}`);
-        return vault.readBinary(file);
+        if (!(file instanceof TFile)) throw new Error('本地文件已变化');
+        if (file.extension.toLowerCase() === 'md') {
+          const decoder = new TextDecoder('utf-8',{fatal:true,ignoreBOM:true});
+          const old = decoder.decode(before), next = decoder.decode(data);
+          await vault.process(file, current => {
+            if (current !== old) throw new Error('本地笔记已变化');
+            return next;
+          });
+        } else {
+          const current = new Uint8Array(await vault.readBinary(file));
+          const old = new Uint8Array(before);
+          if (current.length !== old.length || !current.every((value,index)=>value===old[index])) throw new Error('本地文件已变化');
+          await vault.modifyBinary(file,data);
+        }
       },
       writeFile: async (path, data) => {
         if (!isSafeVaultPath(path, vault.configDir)) throw new Error('Unsafe vault path');

@@ -45,6 +45,7 @@
     }
   },
   "dependencies": {
+    "diff-sequences": "29.6.3",
     "qrcode-generator": "^2.0.4"
   }
 }

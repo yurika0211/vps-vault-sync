@@ -22,6 +22,7 @@ export function isSafeSyncPath(path: string, configDir: string): boolean {
 export interface VaultAdapter {
   readFile(path: string): Promise<ArrayBuffer>;
   writeFile(path: string, data: ArrayBuffer): Promise<void>;
+  replaceReviewed?(path: string, before: ArrayBuffer | null, data: ArrayBuffer): Promise<void>;
   deleteFile(path: string): Promise<void>;
   listAll(): Promise<string[]>;
   // Whether the path is on disk right now. Asked per path (not derived from
@@ -214,6 +215,10 @@ export class SyncEngine {
     }
 
     try {
+      if (this.state.conflicts[change.path]) {
+        await this.state.setConflict(change.path, change.hash || 'deleted');
+        return 'skipped';
+      }
       if (change.action === 'deleted') {
         if (await this.vault.exists(change.path)) {
           const localHash = await sha256hex(await this.vault.readFile(change.path));
@@ -252,9 +257,6 @@ export class SyncEngine {
           if (localHash !== currentHash && localHash !== change.hash) {
             // Preserve the true base and both versions; automatic uploads are
             // blocked until the user resolves the conflict.
-            if (this.state.conflicts[change.path] !== change.hash) {
-              await this.vault.writeFile(conflictSiblingPath(change.path), data);
-            }
             await this.conflict(change.path, change.hash);
             return 'skipped';
           }
@@ -270,6 +272,11 @@ export class SyncEngine {
     }
   }
 
+  private async upload(path: string, data: ArrayBuffer, base: string, modified: number | null) {
+    if (modified && await this.vault.mtime(path) === modified) return this.client.putFile(path, data, base, modified);
+    return this.client.putFile(path, data, base);
+  }
+
   push(path: string): Promise<{ conflict: boolean }> { return this.serial(() => this.pushOnce(path)); }
 
   private async pushOnce(path: string): Promise<{ conflict: boolean }> {
@@ -279,6 +286,7 @@ export class SyncEngine {
       await this.state.queue(path, path in this.state.files ? 'delete' : null);
       return { conflict: false };
     }
+    const modified = await this.vault.mtime(path);
     const data = await this.vault.readFile(path);
     const hash = await sha256hex(data);
 
@@ -290,7 +298,7 @@ export class SyncEngine {
     if (this.state.files[path] === hash) { await this.state.queue(path, null); return { conflict: false }; }
 
     const baseHash = this.state.files[path] ?? '';
-    const result = await this.client.putFile(path, data, baseHash);
+    const result = await this.upload(path, data, baseHash, modified);
     if (result.conflict) {
       await this.conflict(path, result.currentHash ?? 'unknown');
     } else {
@@ -424,9 +432,7 @@ export class SyncEngine {
       }
     }
 
-    // Three-way by content hash. Local bytes are never overwritten by the
-    // server copy. A hash mismatch keeps the local file and writes the remote
-    // bytes beside it.
+    // A mismatch preserves the local file and records the remote version for explicit resolution.
     const skippedDeleted: string[] = [];
     const localPaths = await this.vault.listAll();
     const localSet = new Set(localPaths);
@@ -437,7 +443,6 @@ export class SyncEngine {
         if (!localSet.has(path)) {
           const data = this.client.getFileAt ? await this.client.getFileAt(path, remoteHash) : await this.client.getFile(path);
           if (await this.vault.exists(path) && await sha256hex(await this.vault.readFile(path)) !== remoteHash) {
-            await this.vault.writeFile(conflictSiblingPath(path), data);
             await this.conflict(path, remoteHash);
             continue;
           }
@@ -451,9 +456,6 @@ export class SyncEngine {
           await this.state.setFileHash(path, remoteHash);
           continue;
         }
-        const data = this.client.getFileAt ? await this.client.getFileAt(path, remoteHash) : await this.client.getFile(path);
-        const conflictPath = conflictSiblingPath(path);
-        await this.vault.writeFile(conflictPath, data);
         await this.conflict(path, remoteHash);
       } catch (e) {
         failures++;
@@ -475,8 +477,9 @@ export class SyncEngine {
           await this.conflict(path, 'deleted');
           continue;
         }
+        const modified = await this.vault.mtime(path);
         const data = await this.vault.readFile(path);
-        const uploaded = await this.client.putFile(path, data, '');
+        const uploaded = await this.upload(path, data, '', modified);
         if (uploaded.conflict) { await this.conflict(path, uploaded.currentHash ?? 'unknown'); continue; }
         const hash = await sha256hex(data);
         await this.state.setFileHash(path, hash);

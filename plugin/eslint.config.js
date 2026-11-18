@@ -59,7 +59,7 @@ export default defineConfig([
     // eslint-comments/no-restricted-disable rule blocks for obsidianmd/*
     // and no-deprecated specifically, precisely to force a real decision
     // instead of a silent per-line suppression):
-    files: ['src/settings.ts', 'src/main.ts', 'src/conflictModal.ts'],
+    files: ['src/settings.ts', 'src/main.ts'],
     rules: {
       // trashFile()/setDestructive() need Obsidian 1.6.6+/1.13.0+; this
       // plugin targets minAppVersion 1.11.4 so it still installs on mobile
